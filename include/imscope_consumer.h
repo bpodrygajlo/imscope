@@ -31,6 +31,15 @@ class SafeQueue {
     return true;
   }
 
+  bool try_front(T* item) {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (queue.empty()) {
+      return false;
+    }
+    *item = queue.front();
+    return true;
+  }
+
   bool try_pop(T* item) {
     if (mutex.try_lock()) {
       if (queue.empty()) {
@@ -92,4 +101,8 @@ class ImscopeConsumer {
 
   void request_scope_data(int scope_id, int credits);
   static void free(scope_msg_t* msg);
+
+  scope_type_t get_msg_type(int scope_id) const {
+    return configured_scopes[scope_id].type;
+  }
 };

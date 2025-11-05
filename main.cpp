@@ -37,6 +37,7 @@
 #include <sstream>
 #include <vector>
 #include "implot.h"
+#include "imscope_cache.h"
 #include "imscope_consumer.h"
 
 static void glfw_error_callback(int error, const char* description) {
@@ -58,15 +59,21 @@ typedef struct {
 } IQHistogram;
 
 typedef struct {
-  int scope_id;
-  ImscopeConsumer* consumer;
-  IQSnapshot iq_data;
+  std::string name;
   int plot_type;
   IQHistogram histogram_settings;
-  bool auto_collect = false;
+  std::shared_ptr<Cache> cache;
 } scope_window_t;
 
-static std::map<std::pair<ImscopeConsumer*, int>, scope_window_t> scope_windows;
+typedef struct {
+  int id;
+  ImscopeConsumer* consumer;
+  std::shared_ptr<Cache> cache;
+  bool auto_collect = false;
+  std::vector<scope_window_t> scope_windows;
+} data_window_t;
+
+static std::map<std::pair<ImscopeConsumer*, int>, data_window_t> data_windows;
 
 void show_scatterplot(const char* label, IQSnapshot& iq_data);
 void show_histogram(const char* label, IQSnapshot& iq_data,
@@ -89,20 +96,9 @@ void show_metadata(const NRmetadata& meta) {
 }
 
 void show_scope_window(scope_window_t& scope_window) {
-  ImGui::Begin((scope_window.consumer->get_name() + " - Scope " +
-                scope_window.consumer->get_scope_name(scope_window.scope_id))
-                   .c_str());
-  if (ImGui::Checkbox("Automatically collect data",
-                      &scope_window.auto_collect)) {
-    if (scope_window.auto_collect) {
-      scope_window.consumer->request_scope_data(scope_window.scope_id, 1);
-    }
-  }
-  if (!scope_window.auto_collect) {
-    if (ImGui::Button("Request data")) {
-      scope_window.consumer->request_scope_data(scope_window.scope_id, 1);
-    }
-  }
+  ImGui::Begin((scope_window.name + " - Scope Window").c_str());
+
+  auto iq_data = &scope_window.cache->cached_msgs;
   auto msg =
       scope_window.consumer->try_collect_scope_msg(scope_window.scope_id);
   if (msg) {
@@ -132,6 +128,37 @@ void show_scope_window(scope_window_t& scope_window) {
   }
 
   show_metadata(scope_window.iq_data.meta);
+  ImGui::End();
+}
+
+void show_data_window(data_window_t& data_window) {
+  ImGui::Begin((data_window.consumer->get_name() + " - Data Window").c_str());
+  ImGui::Text("Scope ID: %d", data_window.id);
+  ImGui::Text("Cached messages: %zu", data_window.cache->size());
+  if (ImGui::Checkbox("Automatically collect data",
+                      &data_window.auto_collect)) {
+    if (data_window.auto_collect) {
+      data_window.consumer->request_scope_data(data_window.id, 1);
+    }
+  }
+  if (!data_window.auto_collect) {
+    if (ImGui::Button("Request data")) {
+      data_window.consumer->request_scope_data(data_window.id, 1);
+    }
+  }
+  ImGui::Separator();
+  for (auto& scope_window : data_window.scope_windows) {
+    show_scope_window(scope_window);
+  }
+  if (ImGui::Button("Close all scopes")) {
+    data_window.scope_windows.clear();
+  }
+  if (ImGui::Button("Add scope window")) {
+    scope_window_t new_scope_window = {data_window.id, data_window.consumer,
+                                       IQSnapshot(),   0,
+                                       IQHistogram(),  false};
+    data_window.scope_windows.push_back(new_scope_window);
+  }
   ImGui::End();
 }
 
@@ -224,14 +251,16 @@ void show_consumers() {
       selected < (int)consumers.size()) {
     auto selected_pair =
         std::make_pair(consumers[selected].consumer, selected_scope);
-    if (scope_windows.count(selected_pair) == 0) {
-      if (ImGui::Button("Open scope window")) {
-        scope_windows[selected_pair] = {
-            selected_scope, consumers[selected].consumer, IQSnapshot()};
+    if (data_windows.count(selected_pair) == 0) {
+      if (ImGui::Button("Start data collection")) {
+        data_windows[selected_pair] = {
+            selected_scope, consumers[selected].consumer,
+            std::make_shared<Cache>(selected_scope,
+                                    consumers[selected].consumer)};
       }
     } else {
-      if (ImGui::Button("Close scope window")) {
-        scope_windows.erase(selected_pair);
+      if (ImGui::Button("Stop data collection")) {
+        data_windows.erase(selected_pair);
       }
     }
   }
@@ -349,6 +378,9 @@ void imscope_thread(void) {
     show_consumers();
     for (auto& scope_window : scope_windows) {
       show_scope_window(scope_window.second);
+    }
+    for (auto& data_window : data_windows) {
+      show_data_window(data_window.second);
     }
 
     ImGui::Begin("Global scope settings");
