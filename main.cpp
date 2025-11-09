@@ -71,6 +71,7 @@ typedef struct {
   bool filter_enabled = false;
   float noise_cutoff_linear = 0.0f;
   float noise_cutoff_percentage = 50.0f;
+  int handle = 0;
 } scope_window_t;
 
 static std::map<std::pair<ImscopeConsumer*, int>, scope_window_t> scope_windows;
@@ -130,21 +131,20 @@ void show_scope_window(scope_window_t& scope_window) {
     }
   }
   auto msg =
-      scope_window.consumer->try_collect_scope_msg(scope_window.scope_id);
-  if (msg) {
+      scope_window.consumer->try_collect_scope_msg(scope_window.scope_id, scope_window.handle);
+  if (msg.get() != nullptr) {
     if (scope_window.filter_enabled) {
-      if (scope_window.iq_data.read_scope_msg(msg, scope_window.noise_cutoff_linear, scope_window.noise_cutoff_percentage)) {
+      if (scope_window.iq_data.read_scope_msg(static_cast<scope_msg_t*>(msg.get()), scope_window.noise_cutoff_linear, scope_window.noise_cutoff_percentage)) {
         fit = true;
       }
     }
     else {
-      scope_window.iq_data.read_scope_msg(msg);
+      scope_window.iq_data.read_scope_msg(static_cast<scope_msg_t*>(msg.get()));
       ImPlot::SetNextAxesToFit();
     }
     if (scope_window.auto_collect) {
       scope_window.consumer->request_scope_data(scope_window.scope_id, 1);
     }
-    ImscopeConsumer::free(msg);
   }
 
   const char* items[] = {"Histogram", "RMS", "Scatter"};

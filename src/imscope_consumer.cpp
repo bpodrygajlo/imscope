@@ -11,7 +11,6 @@
 #include "imscope_common.h"
 #include "imscope_internal.h"
 
-#define MAX_QUEUE_SIZE 100
 
 void ImscopeConsumer::start_consumer_thread() {
   std::thread([this]() {
@@ -21,18 +20,14 @@ void ImscopeConsumer::start_consumer_thread() {
       int socket = create_nn_pull_socket(data_address);
 
       while (1) {
-        char* msg_buf = NULL;
+        void* msg_buf = NULL;
         int bytes = nn_recv(socket, &msg_buf, NN_MSG, 0);
         scope_msg_t* msg = (scope_msg_t*)msg_buf;
-        if (this->scope_msg_queues[msg->id].size() > MAX_QUEUE_SIZE) {
-          spdlog::debug(
-              "ImscopeConsumer: Scope {} message queue full, dropping message",
-              msg->id);
-          scope_msg_t* msg_to_free = nullptr;
-          this->scope_msg_queues[msg->id].pop(&msg_to_free);
-          nn_freemsg(msg_to_free);
-        }
-        this->scope_msg_queues[msg->id].push(msg);
+        this->scope_msg_queues[msg->id].push(msg_buf);
+        spdlog::debug(
+            "ImscopeConsumer: Received scope message for scope id {} (frame "
+            "{}, slot {})",
+            msg->id, msg->meta.frame, msg->meta.slot);
       }
     } catch (const std::exception& e) {
       // Log the exception
@@ -55,6 +50,9 @@ ImscopeConsumer::ImscopeConsumer(const char* data_address,
       name(name) {
 
   scope_msg_queues = std::vector<SafePtrQueue>(configured_scopes.size());
+  for (int i = 0; i < configured_scopes.size(); i++) {
+    scope_msg_queues[i] = SafePtrQueue(1000);
+  }
   this->control_socket = create_nn_push_socket(control_address);
   start_consumer_thread();
 }
@@ -97,16 +95,8 @@ ImscopeConsumer* ImscopeConsumer::connect(const char* announce_address) {
   return consumer;
 }
 
-scope_msg_t* ImscopeConsumer::try_collect_scope_msg(int scope_id) {
-  scope_msg_t* msg = nullptr;
-  if (scope_msg_queues[scope_id].try_pop(&msg)) {
-    spdlog::debug(
-        "ImscopeConsumer: Collected scope message for scope id {} (frame {}, "
-        "slot {})",
-        scope_id, msg->meta.frame, msg->meta.slot);
-    return msg;
-  }
-  return nullptr;
+NnMsgPtr ImscopeConsumer::try_collect_scope_msg(int scope_id, int &version) {
+  return scope_msg_queues[scope_id].front(version);
 }
 
 void ImscopeConsumer::request_scope_data(int scope_id, int credits) {

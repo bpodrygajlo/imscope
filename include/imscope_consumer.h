@@ -1,66 +1,69 @@
 #pragma once
 
+#include <nanomsg/nn.h>
+#include <cstddef>
+#include <deque>
 #include <fstream>
 #include <mutex>
-#include <queue>
 #include <vector>
 #include "imscope_common.h"
+#include <memory>
+#include <spdlog/spdlog.h>
 
-template <typename T>
+using NnMsgPtr = std::shared_ptr<void>;
+
+inline NnMsgPtr make_nn_msg_ptr(void* msg) {
+    return NnMsgPtr(msg, [](void* p) { nn_freemsg(p); });
+}
+
 class SafeQueue {
  private:
-  std::queue<T> queue;
+  std::deque<NnMsgPtr> queue;
   std::mutex mutex;
+  size_t max_size;
+  int version_counter = 0;
 
  public:
-  void push(T item) {
+  void push(void* msg) {
     std::unique_lock<std::mutex> lock(mutex);
-
-    queue.push(item);
-  }
-
-  bool pop(T* item) {
-    std::unique_lock<std::mutex> lock(mutex);
-
-    if (queue.empty()) {
-      return false;
+    queue.push_front(make_nn_msg_ptr(msg));
+    if (queue.size() > max_size) {
+      queue.pop_back();
     }
-    *item = queue.front();
-    queue.pop();
-
-    return true;
+    version_counter++;
   }
 
-  bool try_pop(T* item) {
-    if (mutex.try_lock()) {
-      if (queue.empty()) {
-        mutex.unlock();
-        return false;
-      }
-      *item = queue.front();
-      queue.pop();
-      mutex.unlock();
-      return true;
-    }
-    return false;
-  }
-
-  size_t size() {
+  NnMsgPtr front(int& version) {
     std::unique_lock<std::mutex> lock(mutex);
-    return queue.size();
+    if (version != version_counter) {
+      version = version_counter;
+      return queue.front();
+    }
+    return nullptr;
   }
 
-  void empty(int(free_func)(void*)) {
-    std::unique_lock<std::mutex> lock(mutex);
-    while (!queue.empty()) {
-      T item = queue.front();
-      queue.pop();
-      free_func(item);
+  SafeQueue() = default;
+  SafeQueue(size_t size) : max_size(size){};
+  SafeQueue(SafeQueue&& other) {
+    std::unique_lock<std::mutex> lock(other.mutex);
+    queue = std::move(other.queue);
+    max_size = other.max_size;
+    version_counter = other.version_counter;
+  }
+  SafeQueue& operator=(SafeQueue&& other) {
+    if (this != &other) {
+      std::unique_lock<std::mutex> lock_this(mutex, std::defer_lock);
+      std::unique_lock<std::mutex> lock_other(other.mutex, std::defer_lock);
+      std::lock(lock_this, lock_other);
+      queue = std::move(other.queue);
+      max_size = other.max_size;
+      version_counter = other.version_counter;
     }
+    return *this;
   }
 };
 
-using SafePtrQueue = SafeQueue<scope_msg_t*>;
+using SafePtrQueue = SafeQueue;
 
 class ImscopeConsumer {
   std::string control_address;
@@ -76,7 +79,7 @@ class ImscopeConsumer {
   ImscopeConsumer(const char* data_address, const char* announce_address,
                   int num_scopes, imscope_scope_config_t* scopes,
                   const char* name);
-  scope_msg_t* try_collect_scope_msg(int scope_id);
+  NnMsgPtr try_collect_scope_msg(int scope_id, int &handle);
   bool try_collect_iq(int scope_id, std::vector<int16_t>& real,
                       std::vector<int16_t>& imag);
   bool try_collect_real(int scope_id, std::vector<int16_t>& real);
