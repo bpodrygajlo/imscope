@@ -37,6 +37,7 @@ void IQSnapshot::read_scope_msg(scope_msg_t* msg) {
       "ImscopeConsumer: Collected IQ data for scope id {} (frame {}, slot "
       "{})",
       scope_id, msg->meta.frame, msg->meta.slot);
+  meta = msg->meta;
   size_t num_samples = msg->data_size / sizeof(uint32_t);
   real.resize(num_samples);
   imag.resize(num_samples);
@@ -46,6 +47,33 @@ void IQSnapshot::read_scope_msg(scope_msg_t* msg) {
     imag[i] = data[i + 1];
   }
   preprocess();
+}
+
+bool IQSnapshot::read_scope_msg(scope_msg_t* msg, float noise_cutoff_linear, float noise_cutoff_percentage) {
+  spdlog::debug(
+      "ImscopeConsumer: Collected IQ data for scope id {} (frame {}, slot "
+      "{})",
+      scope_id, msg->meta.frame, msg->meta.slot);
+  int num_noise_samples = 0;
+  size_t num_samples = msg->data_size / sizeof(uint32_t) / 2;
+  int16_t* data = (int16_t*)msg->data;
+  for (size_t i = 0; i < num_samples; i++) {
+    float square = data[2 * i] * data[2 * i] + data[2 * i + 1] * data[2 * i + 1];
+    if (square < 2 * noise_cutoff_linear * noise_cutoff_linear) {
+      num_noise_samples++;
+    }
+  }
+
+  spdlog::debug("Noise samples: {}/{}", num_noise_samples, num_samples);
+  spdlog::debug("Noise percentage: {}%", noise_cutoff_percentage);
+  float noise_percentage = (num_noise_samples / (float)num_samples) * 100.0f;
+  if (noise_percentage > noise_cutoff_percentage) {
+    return false;
+  }
+
+
+  read_scope_msg(msg);
+  return true;
 }
 
 void VectorSnapshot::preprocess() {

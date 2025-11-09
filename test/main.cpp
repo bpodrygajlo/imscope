@@ -18,7 +18,7 @@ int main() {
   while (1) {
     uint16_t data[1024];
     for (int i = 0; i < 1024; i++) {
-      data[i] = dis(gen);
+      data[i] = dis(gen) / 10;
     }
     std::cout << "Producing data " << data_produced++ << std::endl;
     imscope_send_data((uint32_t*)data, 0, 512, 0, 0);

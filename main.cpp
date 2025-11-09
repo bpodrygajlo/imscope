@@ -20,11 +20,13 @@
  */
 
 #include <stdio.h>
+#include <cstdint>
 #include <optional>
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "imscope_tools.h"
+#include "src/imscope_tools.h"
 #define GL_SILENCE_DEPRECATION
 #if defined(IMGUI_IMPL_OPENGL_ES2)
 #include <GLES2/gl2.h>
@@ -61,9 +63,14 @@ typedef struct {
   int scope_id;
   ImscopeConsumer* consumer;
   IQSnapshot iq_data;
+  std::vector<IQSnapshot> iq_history;
   int plot_type;
   IQHistogram histogram_settings;
   bool auto_collect = false;
+
+  bool filter_enabled = false;
+  float noise_cutoff_linear = 0.0f;
+  float noise_cutoff_percentage = 50.0f;
 } scope_window_t;
 
 static std::map<std::pair<ImscopeConsumer*, int>, scope_window_t> scope_windows;
@@ -98,6 +105,25 @@ void show_scope_window(scope_window_t& scope_window) {
       scope_window.consumer->request_scope_data(scope_window.scope_id, 1);
     }
   }
+
+  bool fit = false;
+  ImGui::Checkbox("Enable ingress filtering", &scope_window.filter_enabled);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Filter out scope messages with too much noise before plotting");
+  }
+  if (scope_window.filter_enabled) {
+    if (ImGui::SliderFloat("Noise cutoff (linear)", &scope_window.noise_cutoff_linear, 0.0f, INT16_MAX)) {
+      fit = true;
+    }
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("Samples with magnitude below this value are considered noise");
+    }
+    ImGui::SliderFloat("Noise cutoff percentage", &scope_window.noise_cutoff_percentage, 0.0f, 100.0f);
+    if (ImGui::IsItemHovered()) {
+      ImGui::SetTooltip("What percentage of samples can be noise before rejecting the entire scope message");
+    }
+  }
+
   if (!scope_window.auto_collect) {
     if (ImGui::Button("Request data")) {
       scope_window.consumer->request_scope_data(scope_window.scope_id, 1);
@@ -106,11 +132,18 @@ void show_scope_window(scope_window_t& scope_window) {
   auto msg =
       scope_window.consumer->try_collect_scope_msg(scope_window.scope_id);
   if (msg) {
-    scope_window.iq_data.read_scope_msg(msg);
+    if (scope_window.filter_enabled) {
+      if (scope_window.iq_data.read_scope_msg(msg, scope_window.noise_cutoff_linear, scope_window.noise_cutoff_percentage)) {
+        fit = true;
+      }
+    }
+    else {
+      scope_window.iq_data.read_scope_msg(msg);
+      ImPlot::SetNextAxesToFit();
+    }
     if (scope_window.auto_collect) {
       scope_window.consumer->request_scope_data(scope_window.scope_id, 1);
     }
-    ImPlot::SetNextAxesToFit();
     ImscopeConsumer::free(msg);
   }
 
