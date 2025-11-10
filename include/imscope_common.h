@@ -16,6 +16,7 @@
 typedef struct {
   uint32_t frame;
   uint32_t slot;
+  uint64_t timestamp;
 } NRmetadata;
 
 typedef enum {

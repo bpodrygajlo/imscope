@@ -1,5 +1,6 @@
 #include "imscope_tools.h"
 #include <spdlog/spdlog.h>
+#include <algorithm>
 #include <cmath>
 
 void IQSnapshot::preprocess() {
@@ -32,21 +33,51 @@ size_t IQSnapshot::size() {
   return real.size();
 }
 
-void IQSnapshot::read_scope_msg(scope_msg_t* msg) {
+void IQSnapshot::read_scope_msg(scope_msg_t* msg, bool collect) {
   spdlog::debug(
       "ImscopeConsumer: Collected IQ data for scope id {} (frame {}, slot "
       "{})",
       scope_id, msg->meta.frame, msg->meta.slot);
   meta = msg->meta;
   size_t num_samples = msg->data_size / sizeof(uint32_t);
-  real.resize(num_samples);
-  imag.resize(num_samples);
-  int16_t* data = (int16_t*)msg->data;
-  for (size_t i = 0; i < num_samples; i += 2) {
-    real[i] = data[i];
-    imag[i] = data[i + 1];
+  if (!collect) {
+    real.resize(num_samples);
+    imag.resize(num_samples);
+    int16_t* data = (int16_t*)msg->data;
+    for (size_t i = 0; i < num_samples; i += 2) {
+      real[i] = data[i];
+      imag[i] = data[i + 1];
+    }
+    preprocess();
+  } else {
+    size_t current_size = real.size();
+    size_t gap = msg->meta.timestamp - current_timestamp;
+    size_t new_size = current_size + num_samples + gap;
+    real.resize(new_size);
+    imag.resize(new_size);
+
+    for (int i = 0; i < gap; i++) {
+      real[current_size + i] = 0;
+      imag[current_size + i] = 0;
+    }
+
+    // Write new samples
+    int16_t* data = (int16_t*)msg->data;
+    for (int i = 0; i < num_samples; i++) {
+      real[current_size + gap + i] = data[i * 2];
+      imag[current_size + gap + i] = data[i * 2 + 1];
+    }
+    
+    current_timestamp = msg->meta.timestamp + num_samples;
+
+    if (new_size > max_stacked_size) {
+      std::rotate(real.begin(), real.begin() + new_size - max_stacked_size, real.end());
+      std::rotate(imag.begin(), imag.begin() + new_size - max_stacked_size, imag.end());
+      real.resize(max_stacked_size);
+      imag.resize(max_stacked_size);
+    }
+    preprocess();
   }
-  preprocess();
 }
 
 bool IQSnapshot::read_scope_msg(scope_msg_t* msg, float noise_cutoff_linear, float noise_cutoff_percentage) {

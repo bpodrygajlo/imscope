@@ -15,13 +15,15 @@ int main() {
   std::random_device rd;
   std::mt19937 gen(rd());
   std::uniform_int_distribution<uint16_t> dis(0, 65535);
+  uint64_t timestamp = 0;
   while (1) {
     uint16_t data[1024];
     for (int i = 0; i < 1024; i++) {
       data[i] = dis(gen) / 10;
     }
     std::cout << "Producing data " << data_produced++ << std::endl;
-    imscope_send_data((uint32_t*)data, 0, 512, 0, 0);
+    imscope_send_data((uint32_t*)data, 0, 512, 0, 0, timestamp);
+    timestamp += 512;
     sleep(1);
   }
 }

@@ -63,7 +63,6 @@ typedef struct {
   int scope_id;
   ImscopeConsumer* consumer;
   IQSnapshot iq_data;
-  std::vector<IQSnapshot> iq_history;
   int plot_type;
   IQHistogram histogram_settings;
   bool auto_collect = false;
@@ -72,6 +71,7 @@ typedef struct {
   float noise_cutoff_linear = 0.0f;
   float noise_cutoff_percentage = 50.0f;
   int handle = 0;
+  bool collecting = false;
 } scope_window_t;
 
 static std::map<std::pair<ImscopeConsumer*, int>, scope_window_t> scope_windows;
@@ -124,6 +124,13 @@ void show_scope_window(scope_window_t& scope_window) {
       ImGui::SetTooltip("What percentage of samples can be noise before rejecting the entire scope message");
     }
   }
+  ImGui::Checkbox("Enable collecting by timestamp", &scope_window.collecting);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Collect incoming data by scope message timestamp. This will stack samples in order of timestamp.");
+  }
+  if (scope_window.collecting) {
+    ImGui::SliderInt("Size of stacked data", (int*)&scope_window.iq_data.max_stacked_size, 1000, 100000);
+  }
 
   if (!scope_window.auto_collect) {
     if (ImGui::Button("Request data")) {
@@ -139,7 +146,7 @@ void show_scope_window(scope_window_t& scope_window) {
       }
     }
     else {
-      scope_window.iq_data.read_scope_msg(static_cast<scope_msg_t*>(msg.get()));
+      scope_window.iq_data.read_scope_msg(static_cast<scope_msg_t*>(msg.get()), scope_window.collecting);
       ImPlot::SetNextAxesToFit();
     }
     if (scope_window.auto_collect) {

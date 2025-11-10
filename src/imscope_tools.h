@@ -32,11 +32,13 @@ typedef struct {
   int16_t max_iq;
   float max_power;
   int nonzero_count;
+  uint64_t current_timestamp;
+  uint64_t max_stacked_size = 30000;
   void preprocess();
 
  public:
   size_t size();
-  void read_scope_msg(scope_msg_t* msg);
+  void read_scope_msg(scope_msg_t* msg, bool collect = false);
   bool read_scope_msg(scope_msg_t* msg, float noise_cutoff_filter_dBFS, float noise_cutoff_percentage);
 } IQSnapshot;
 

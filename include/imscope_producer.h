@@ -16,7 +16,7 @@ int imscope_init_producer(const char* control_address, const char* data_address,
                           const char* announce_address, const char* name,
                           imscope_scope_desc_t* scopes, size_t num_scopes);
 int imscope_send_data(uint32_t* data, int id, size_t num_samples, int frame,
-                      int slot);
+                      int slot, uint64_t timestamp);
 #ifdef __cplusplus
 }
 #endif

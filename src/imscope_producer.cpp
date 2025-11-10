@@ -161,7 +161,7 @@ class ImscopeProducer {
   }
 
   void send_scope_data(uint32_t* data, int id, size_t num_samples, int frame,
-                       int slot) {
+                       int slot, uint64_t timestamp) {
     if (credits[id].load() < 0) {
       return;
     }
@@ -176,6 +176,8 @@ class ImscopeProducer {
     scope_msg_t* msg = (scope_msg_t*)msg_buf;
     msg->id = id;
     msg->meta.frame = frame;
+    msg->meta.slot = slot;
+    msg->meta.timestamp = timestamp;
     msg->data_size = num_samples * sizeof(uint32_t);
     memcpy((void*)(msg + 1), data, sizeof(uint32_t) * num_samples);
     msg->time_taken_in_ns =
@@ -206,10 +208,10 @@ extern "C" int imscope_init_producer(const char* control_address,
 }
 
 extern "C" int imscope_send_data(uint32_t* data, int id, size_t num_samples,
-                                 int frame, int slot) {
+                                 int frame, int slot, uint64_t timestamp) {
   if (instance == nullptr) {
     return -1;  // Not initialized
   }
-  instance->send_scope_data(data, id, num_samples, frame, slot);
+  instance->send_scope_data(data, id, num_samples, frame, slot, timestamp);
   return 0;  // Success
 }
