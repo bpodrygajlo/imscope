@@ -19,6 +19,12 @@ endif()
 include("cmake/get_cpm.cmake")
 include("cmake/imgui.cmake")
 CPMAddPackage("gh:gabime/spdlog#v1.16.0")
+CPMAddPackage(
+  NAME googletest
+  GITHUB_REPOSITORY google/googletest
+  VERSION 1.15.2
+  OPTIONS "INSTALL_GTEST OFF" "gtest_force_shared_crt ON"
+)
 
 add_library(imscope_internal src/imscope_internal.cpp)
 target_include_directories(imscope_internal PUBLIC src/ include/)
@@ -41,3 +47,15 @@ target_link_libraries(imscope imscope_consumer imscope_producer imgui implot img
 
 add_executable(imscope_test test/main.cpp)
 target_link_libraries(imscope_test PRIVATE imscope_producer)
+
+enable_testing()
+add_executable(imscope_integration_test test/integration_test.cpp)
+target_link_libraries(imscope_integration_test
+    PRIVATE
+    imscope_producer
+    imscope_consumer
+    imscope_internal
+    GTest::gtest_main
+)
+include(GoogleTest)
+gtest_discover_tests(imscope_integration_test)
