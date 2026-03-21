@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2025-2026 Bartosz Podrygajlo
+ *
+ * Licensed under the MIT License.
+ * See LICENSE file in the project root for full license information.
+ */
+
 #pragma once
 
 #include <cstdint>
@@ -39,7 +46,8 @@ typedef struct {
  public:
   size_t size();
   void read_scope_msg(scope_msg_t* msg, bool collect = false);
-  bool read_scope_msg(scope_msg_t* msg, float noise_cutoff_filter_dBFS, float noise_cutoff_percentage);
+  bool read_scope_msg(scope_msg_t* msg, float noise_cutoff_filter_dBFS,
+                      float noise_cutoff_percentage);
 } IQSnapshot;
 
 typedef struct {

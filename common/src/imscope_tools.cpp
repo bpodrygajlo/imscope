@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2025-2026 Bartosz Podrygajlo
+ *
+ * Licensed under the MIT License.
+ * See LICENSE file in the project root for full license information.
+ */
+
 #include "imscope_tools.h"
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -67,12 +74,14 @@ void IQSnapshot::read_scope_msg(scope_msg_t* msg, bool collect) {
       real[current_size + gap + i] = data[i * 2];
       imag[current_size + gap + i] = data[i * 2 + 1];
     }
-    
+
     current_timestamp = msg->meta.timestamp + num_samples;
 
     if (new_size > max_stacked_size) {
-      std::rotate(real.begin(), real.begin() + new_size - max_stacked_size, real.end());
-      std::rotate(imag.begin(), imag.begin() + new_size - max_stacked_size, imag.end());
+      std::rotate(real.begin(), real.begin() + new_size - max_stacked_size,
+                  real.end());
+      std::rotate(imag.begin(), imag.begin() + new_size - max_stacked_size,
+                  imag.end());
       real.resize(max_stacked_size);
       imag.resize(max_stacked_size);
     }
@@ -80,7 +89,8 @@ void IQSnapshot::read_scope_msg(scope_msg_t* msg, bool collect) {
   }
 }
 
-bool IQSnapshot::read_scope_msg(scope_msg_t* msg, float noise_cutoff_linear, float noise_cutoff_percentage) {
+bool IQSnapshot::read_scope_msg(scope_msg_t* msg, float noise_cutoff_linear,
+                                float noise_cutoff_percentage) {
   spdlog::debug(
       "ImscopeConsumer: Collected IQ data for scope id {} (frame {}, slot "
       "{})",
@@ -89,7 +99,8 @@ bool IQSnapshot::read_scope_msg(scope_msg_t* msg, float noise_cutoff_linear, flo
   size_t num_samples = msg->data_size / sizeof(uint32_t) / 2;
   int16_t* data = (int16_t*)msg->data;
   for (size_t i = 0; i < num_samples; i++) {
-    float square = data[2 * i] * data[2 * i] + data[2 * i + 1] * data[2 * i + 1];
+    float square =
+        data[2 * i] * data[2 * i] + data[2 * i + 1] * data[2 * i + 1];
     if (square < 2 * noise_cutoff_linear * noise_cutoff_linear) {
       num_noise_samples++;
     }
@@ -101,7 +112,6 @@ bool IQSnapshot::read_scope_msg(scope_msg_t* msg, float noise_cutoff_linear, flo
   if (noise_percentage > noise_cutoff_percentage) {
     return false;
   }
-
 
   read_scope_msg(msg);
   return true;
