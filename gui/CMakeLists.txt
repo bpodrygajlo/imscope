@@ -3,7 +3,11 @@ project(imscope_gui)
 
 include("../cmake/imgui.cmake")
 
-add_executable(imscope src/imscope-gui.cpp)
+if(WIN32)
+    add_executable(imscope WIN32 src/imscope-gui.cpp)
+else()
+    add_executable(imscope src/imscope-gui.cpp)
+endif()
 target_link_libraries(imscope
     PRIVATE
     imscope_consumer

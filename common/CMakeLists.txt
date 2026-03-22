@@ -19,6 +19,9 @@ CPMAddPackage(
 add_library(imscope_internal src/imscope_internal.cpp src/imscope_internal.h)
 target_include_directories(imscope_internal PUBLIC src/ include/)
 target_link_libraries(imscope_internal PUBLIC nng spdlog)
+if(WIN32)
+    target_link_libraries(imscope_internal PUBLIC ws2_32 advapi32 shlwapi)
+endif()
 
 add_library(imscope_producer src/imscope_producer.cpp)
 target_include_directories(imscope_producer PUBLIC include/)

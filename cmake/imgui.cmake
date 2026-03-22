@@ -15,6 +15,9 @@
   add_library(imgui_glfw_backend ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp)
   target_include_directories(imgui_glfw_backend PUBLIC ${imgui_SOURCE_DIR}/backends/)
   target_link_libraries(imgui_glfw_backend PUBLIC imgui)
+  if(WIN32)
+    target_link_libraries(imgui_glfw_backend PUBLIC imm32 dwmapi)
+  endif()
 
   find_package(OpenGL REQUIRED)
   find_package(glfw3 3.3 REQUIRED)
