@@ -1,6 +1,16 @@
+# imscope Licensing
+
+This project uses a hybrid licensing model to encourage adoption of the producer API while ensuring the GUI tool remains open and community-driven.
+
+## Component Licenses
+
+### 1. Producer Library (`common/`)
+The code in the `common/` directory, which includes the C producer API and shared utilities, is licensed under the **MIT License**. This allows for easy integration into any project, including proprietary ones.
+
+```text
 MIT License
 
-Copyright (c) 2024 imscope
+Copyright (c) 2025-2026 Bartosz Podrygajlo
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -19,3 +29,13 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+### 2. GUI Application (`gui/`) and Main Application Logic
+The `imscope` GUI application and related consumer logic are licensed under the **GNU Affero General Public License v3.0 (AGPLv3)**. This ensures that any improvements to the tool itself remain open-source and benefits the community.
+
+For commercial licensing options (e.g., if you wish to integrate the GUI into a proprietary product), please contact the maintainers.
+
+---
+
+A copy of the full AGPLv3 license text can be found in the [LICENSE-AGPL](LICENSE-AGPL) file (or at https://www.gnu.org/licenses/agpl-3.0.en.html).

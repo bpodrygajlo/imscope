@@ -1,3 +1,10 @@
+/*
+ * Copyright (c) 2025-2026 Bartosz Podrygajlo
+ *
+ * Licensed under the MIT License.
+ * See LICENSE file in the project root for full license information.
+ */
+
 #ifndef IMSCOPE_COMMON_H
 #define IMSCOPE_COMMON_H
 
@@ -18,6 +25,13 @@ typedef struct {
   uint32_t slot;
   uint64_t timestamp;
 } NRmetadata;
+
+typedef enum {
+  IMSCOPE_SUCCESS = 0,
+  IMSCOPE_ERROR_NOT_INITIALIZED = -1,
+  IMSCOPE_ERROR_INVALID_ID = -2,
+  IMSCOPE_ERROR_BUSY = -3,
+} imscope_return_t;
 
 typedef enum {
   SCOPE_TYPE_REAL = 0,

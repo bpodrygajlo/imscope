@@ -9,7 +9,7 @@ imscope is a real-time IQ data visualization tool designed for high-data-rate ap
     *   Scatterplot (Constellation diagram)
     *   Histogram (IQ distribution)
     *   RMS (Power over time/samples)
-*   **Remote Connection:** Connect to data producers via TCP using the Nanomsg library.
+*   **Remote Connection:** Connect to data producers via TCP using the NNG library.
 *   **Ingress Filtering:** Filter out noise based on linear magnitude or percentage of samples.
 *   **Data Stacking:** Collect and stack samples by timestamp for deeper analysis.
 *   **Modern GUI:** Built with [Dear ImGui](https://github.com/ocornut/imgui) and [ImPlot](https://github.com/epezent/implot).
@@ -20,7 +20,7 @@ To build imscope, you need the following dependencies:
 
 *   **CMake** (>= 3.10)
 *   **C++17 Compiler** (GCC, Clang, MSVC)
-*   **Nanomsg** (Communication library)
+*   **NNG** (Communication library)
 *   **OpenGL** (Graphics API)
 *   **GLFW3** (Windowing and input)
 
@@ -70,13 +70,12 @@ To visualize data from your application, you need to use the `imscope` producer 
 
     ```c
     imscope_scope_desc_t scopes[] = {
-        {"Scope 1", IMSCOPE_TYPE_IQ},
-        {"Scope 2", IMSCOPE_TYPE_IQ}
+        {"Scope 1", SCOPE_TYPE_IQ_DATA},
+        {"Scope 2", SCOPE_TYPE_IQ_DATA}
     };
 
-    // Initialize producer with addresses for control, data, and announce sockets
+    // Initialize producer with addresses for data and announce sockets
     imscope_init_producer(
-        "tcp://0.0.0.0:5557", // Control address
         "tcp://0.0.0.0:5558", // Data address
         "tcp://0.0.0.0:5559", // Announce address
         "My Producer",        // Producer name
@@ -95,7 +94,7 @@ To visualize data from your application, you need to use the `imscope` producer 
     int slot = 0;
     uint64_t timestamp = ...;
 
-    imscope_send_data(
+    imscope_return_t ret = imscope_try_send_data(
         iq_data.data(),
         0,              // Scope ID (index in the scopes array)
         iq_data.size(), // Number of samples
@@ -103,8 +102,16 @@ To visualize data from your application, you need to use the `imscope` producer 
         slot,
         timestamp
     );
+    if (ret != IMSCOPE_SUCCESS) {
+        // Handle error or busy state
+    }
     ```
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project uses a hybrid licensing model:
+
+*   **Producer Library (`common/`):** Licensed under the **MIT License**. This allows for easy integration into high-performance 5G stacks and other proprietary or open-source applications.
+*   **GUI Application (`gui/`):** Licensed under the **GNU Affero General Public License v3.0 (AGPLv3)**. This ensures that the visualization tool itself remains open-source and benefits the community.
+
+See the [LICENSE](LICENSE) file for more details. For commercial licensing of the GUI, please contact the maintainers.

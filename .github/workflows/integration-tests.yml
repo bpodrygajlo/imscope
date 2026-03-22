@@ -1,0 +1,30 @@
+name: Integration Tests
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    if: contains(fromJSON('["MEMBER", "OWNER", "COLLABORATOR"]'), github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake
+
+    - name: Configure and Build Common
+      run: |
+        mkdir -p common/build
+        cd common/build
+        cmake ..
+        make -j$(nproc)
+
+    - name: Run Integration Tests
+      run: |
+        cd common/build
+        ctest --output-on-failure
