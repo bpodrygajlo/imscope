@@ -48,7 +48,7 @@ class ImscopeProducer {
     int id;
 
     ScopeCtx(nng_socket socket, ImscopeProducer* p, int idx)
-        : parent(p), id(idx), busy(false), acquired_msg(nullptr) {
+        : busy(false), acquired_msg(nullptr), parent(p), id(idx) {
       nng_ctx_open(&ctx, socket);
       nng_aio_alloc(&send_aio, send_callback, this);
       nng_aio_alloc(&recv_aio, recv_callback, this);
@@ -98,7 +98,9 @@ class ImscopeProducer {
 
   void start_announce_thread() {
     announce_thread_handle = std::thread([this]() {
+#if !defined(_WIN32)
       pthread_setname_np(pthread_self(), "imscope_announce");
+#endif
       const char* announce_address = this->announce_address.c_str();
       nng_socket rep_sock;
       nng_rep0_open(&rep_sock);

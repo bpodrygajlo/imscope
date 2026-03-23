@@ -11,7 +11,7 @@
 #include <vector>
 #include "imscope_common.h"
 
-typedef struct MovingAverageTimer {
+struct MovingAverageTimer {
   uint64_t sum = 0;
   float average = 0;
   float last_update_time = 0;
@@ -19,15 +19,15 @@ typedef struct MovingAverageTimer {
   void UpdateAverage(float time) {
     if (time > last_update_time + 1) {
       float new_average = sum / (float)((time - last_update_time) / 1000);
-      average = 0.95 * average + 0.05 * new_average;
+      average = 0.95f * average + 0.05f * new_average;
       sum = 0;
     }
   }
 
   void Add(uint64_t ns) { sum += ns; }
-} MovingAverageTimer;
+};
 
-typedef struct {
+struct IQSnapshot {
   // Raw data
   NRmetadata meta;
   int scope_id;
@@ -48,9 +48,9 @@ typedef struct {
   void read_scope_msg(scope_msg_t* msg, bool collect = false);
   bool read_scope_msg(scope_msg_t* msg, float noise_cutoff_filter_dBFS,
                       float noise_cutoff_percentage);
-} IQSnapshot;
+};
 
-typedef struct {
+struct VectorSnapshot {
   // Raw data
   NRmetadata meta;
   int scope_id;
@@ -65,4 +65,4 @@ typedef struct {
   size_t size() const { return v.size(); }
 
   void read_scope_msg(scope_msg_t* msg);
-} VectorSnapshot;
+};

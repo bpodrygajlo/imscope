@@ -116,14 +116,14 @@ ImscopeConsumer::ImscopeConsumer(const char* data_address,
       announce_address(announce_address),
       configured_scopes(scopes, scopes + num_scopes),
       name(name) {
-  for (int i = 0; i < configured_scopes.size(); i++) {
+  for (size_t i = 0; i < configured_scopes.size(); i++) {
     scope_buffers.push_back(std::make_unique<ScopeBuffer>());
   }
 
   this->data_socket = create_nng_rep_socket(data_address);
 
   // Create twice as many workers as scopes to handle potential overlaps
-  for (int i = 0; i < num_scopes * 2; i++) {
+  for (size_t i = 0; i < (size_t)num_scopes * 2; i++) {
     auto worker = std::make_unique<ContextWorker>(this->data_socket, this);
     worker->start_recv();
     workers.push_back(std::move(worker));
@@ -184,8 +184,4 @@ NngMsgPtr ImscopeConsumer::try_collect_scope_msg(int scope_id, int& version) {
     return msg;
   }
   return nullptr;
-}
-
-void ImscopeConsumer::free(scope_msg_t* msg) {
-  // Handled by NngMsgPtr deleter
 }

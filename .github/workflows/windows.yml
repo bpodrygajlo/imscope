@@ -1,0 +1,37 @@
+name: Build Windows Executable
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up CMake
+        uses: jwlawson/actions-setup-cmake@v2
+
+      - name: Install dependencies via vcpkg
+        run: vcpkg install glfw3:x64-windows nng:x64-windows
+
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -DIMSCOPE_BUILD_EXAMPLES=OFF
+          -DIMSCOPE_BUILD_TESTS=OFF
+          -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+          -DCPM_SOURCE_CACHE="${{ github.workspace }}/.cpm_cache"
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Upload Executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: imscope-gui
+          path: build/Release/*.exe

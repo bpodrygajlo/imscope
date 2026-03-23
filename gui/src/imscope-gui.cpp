@@ -79,10 +79,10 @@ void show_rms(const char* label, IQSnapshot& iq_data);
 void show_metadata(const NRmetadata& meta) {
   ImGui::BeginGroup();
   std::stringstream ss;
-  if (meta.slot != -1) {
+  if (meta.slot != 0xFFFFFFFF) {
     ss << " slot: " << meta.slot;
   }
-  if (meta.frame != -1) {
+  if (meta.frame != 0xFFFFFFFF) {
     ss << " frame: " << meta.frame;
   }
   if (!ss.str().empty()) {
@@ -155,9 +155,12 @@ void show_scope_window(scope_window_t& scope_window) {
       } else {
         scope_window.iq_data.read_scope_msg(
             static_cast<scope_msg_t*>(msg.get()), scope_window.collecting);
-        ImPlot::SetNextAxesToFit();
       }
     }
+  }
+
+  if (fit) {
+    ImPlot::SetNextAxesToFit();
   }
 
   const char* items[] = {"Histogram", "RMS", "Scatter"};
@@ -184,11 +187,12 @@ void show_scope_window(scope_window_t& scope_window) {
 void show_scatterplot(const char* label, IQSnapshot& iq_data) {
   float x = ImGui::CalcItemWidth();
   if (ImPlot::BeginPlot(label, {x, x})) {
-    int points_drawn = 0;
+    size_t points_drawn = 0;
     ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 1, IMPLOT_AUTO_COL, 1);
     while (points_drawn < iq_data.size()) {
       // Limit the amount of data plotted with PlotScatter call (issue with vertices/draw call)
-      int points_to_draw = std::min(iq_data.size() - points_drawn, 16000UL);
+      int points_to_draw =
+          std::min<size_t>(iq_data.size() - points_drawn, 16000UL);
       ImPlot::PlotScatter(label, iq_data.real.data() + points_drawn,
                           iq_data.imag.data() + points_drawn, points_to_draw);
       points_drawn += points_to_draw;
@@ -245,7 +249,7 @@ void draw_menu_bar(bool& show_imgui_demo_window, bool& show_implot_demo_window,
   }
 }
 
-const char* get_names(void* arg, int idx) {
+const char* get_names(void* /*arg*/, int idx) {
   const char* name = consumers[idx].name.c_str();
   return name;
 }
@@ -273,7 +277,18 @@ void show_consumers() {
     if (scope_windows.count(selected_pair) == 0) {
       if (ImGui::Button("Open scope window")) {
         scope_windows[selected_pair] = {
-            selected_scope, consumers[selected].consumer, IQSnapshot()};
+            selected_scope,
+            consumers[selected].consumer,
+            IQSnapshot(),
+            0,              // plot_type
+            IQHistogram(),  // histogram_settings
+            false,          // auto_collect
+            false,          // filter_enabled
+            0.0f,           // noise_cutoff_linear
+            50.0f,          // noise_cutoff_percentage
+            0,              // handle
+            false           // collecting
+        };
       }
     } else {
       if (ImGui::Button("Close scope window")) {
@@ -384,7 +399,6 @@ void imscope_thread(void) {
     int display_w, display_h;
     glfwGetFramebufferSize(window, &display_w, &display_h);
 
-    static float t = 0;
     static bool show_imgui_demo_window = false;
     static bool show_implot_demo_window = false;
     ImGui::DockSpaceOverViewport();
@@ -430,6 +444,8 @@ void imscope_thread(void) {
 }
 
 int main(int argc, char** argv) {
+  (void)argc;
+  (void)argv;
   spdlog::set_level(spdlog::level::info);
   imscope_thread();
 }

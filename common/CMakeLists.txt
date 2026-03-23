@@ -9,16 +9,27 @@ CPMAddPackage(
   VERSION 1.15.2
   OPTIONS "INSTALL_GTEST OFF" "gtest_force_shared_crt ON"
 )
-CPMAddPackage(
-  NAME nng
-  GITHUB_REPOSITORY nanomsg/nng
-  GIT_TAG v1.9.0
-  OPTIONS "NNG_TESTS OFF" "NNG_ENABLE_NNG_COMPAT ON"
-)
+find_package(nng CONFIG QUIET)
+if(nng_FOUND)
+  message(STATUS "Found nng via find_package")
+  if(NOT TARGET nng AND TARGET nng::nng)
+    add_library(nng ALIAS nng::nng)
+  endif()
+else()
+  CPMAddPackage(
+    NAME nng
+    GITHUB_REPOSITORY nanomsg/nng
+    GIT_TAG v1.9.0
+    OPTIONS "NNG_TESTS OFF" "NNG_ENABLE_NNG_COMPAT ON"
+  )
+endif()
 
 add_library(imscope_internal src/imscope_internal.cpp src/imscope_internal.h)
 target_include_directories(imscope_internal PUBLIC src/ include/)
 target_link_libraries(imscope_internal PUBLIC nng spdlog)
+if(WIN32)
+    target_link_libraries(imscope_internal PUBLIC ws2_32 advapi32 shlwapi)
+endif()
 
 add_library(imscope_producer src/imscope_producer.cpp)
 target_include_directories(imscope_producer PUBLIC include/)

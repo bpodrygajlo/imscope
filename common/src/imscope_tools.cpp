@@ -19,13 +19,13 @@ void IQSnapshot::preprocess() {
   for (size_t i = 0; i < size(); i++) {
     int16_t r = real[i];
     int16_t im = imag[i];
-    if (abs(r) > max_iq) {
-      max_iq = abs(r);
+    if (static_cast<int16_t>(abs(r)) > max_iq) {
+      max_iq = static_cast<int16_t>(abs(r));
     }
-    if (abs(im) > max_iq) {
-      max_iq = abs(im);
+    if (static_cast<int16_t>(abs(im)) > max_iq) {
+      max_iq = static_cast<int16_t>(abs(im));
     }
-    float p = r * r + im * im;
+    float p = static_cast<float>(r * r + im * im);
     power[i] = p;
     if (p > max_power) {
       max_power = p;
@@ -63,14 +63,14 @@ void IQSnapshot::read_scope_msg(scope_msg_t* msg, bool collect) {
     real.resize(new_size);
     imag.resize(new_size);
 
-    for (int i = 0; i < gap; i++) {
+    for (size_t i = 0; i < gap; i++) {
       real[current_size + i] = 0;
       imag[current_size + i] = 0;
     }
 
     // Write new samples
     int16_t* data = (int16_t*)msg->data;
-    for (int i = 0; i < num_samples; i++) {
+    for (size_t i = 0; i < num_samples; i++) {
       real[current_size + gap + i] = data[i * 2];
       imag[current_size + gap + i] = data[i * 2 + 1];
     }
@@ -99,8 +99,8 @@ bool IQSnapshot::read_scope_msg(scope_msg_t* msg, float noise_cutoff_linear,
   size_t num_samples = msg->data_size / sizeof(uint32_t) / 2;
   int16_t* data = (int16_t*)msg->data;
   for (size_t i = 0; i < num_samples; i++) {
-    float square =
-        data[2 * i] * data[2 * i] + data[2 * i + 1] * data[2 * i + 1];
+    float square = static_cast<float>(data[2 * i] * data[2 * i] +
+                                      data[2 * i + 1] * data[2 * i + 1]);
     if (square < 2 * noise_cutoff_linear * noise_cutoff_linear) {
       num_noise_samples++;
     }
@@ -122,8 +122,8 @@ void VectorSnapshot::preprocess() {
   nonzero_count = 0;
   for (size_t i = 0; i < v.size(); i++) {
     int16_t value = v[i];
-    if (abs(value) > max) {
-      max = abs(value);
+    if (static_cast<int16_t>(abs(value)) > max) {
+      max = static_cast<int16_t>(abs(value));
     }
     if (value != 0) {
       nonzero_count++;

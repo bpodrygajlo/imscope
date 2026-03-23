@@ -60,6 +60,4 @@ class ImscopeConsumer {
   }
 
   int get_num_scopes() const { return configured_scopes.size(); }
-
-  static void free(scope_msg_t* msg);
 };
