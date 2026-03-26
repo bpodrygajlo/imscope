@@ -36,17 +36,28 @@ TEST(IntegrationTest, ProducerConsumerInprocMultiScope) {
   ASSERT_EQ(consumer->get_name(), producer_name);
   ASSERT_EQ(consumer->get_num_scopes(), 2);
 
+  // Trigger initial requests
+  consumer->request_data(0);
+  consumer->request_data(1);
+
   // Data to send
   uint32_t data1[] = {1, 2, 3};
   uint32_t data2[] = {10, 20, 30};
   size_t num_samples = 3;
   uint64_t timestamp = 1000;
 
-  // 1. Send data for scope 0
-  res = imscope_try_send_data(data1, 0, num_samples, 1, 0, timestamp);
+  // 1. Send data for scope 0 (succeeds)
+  // Use a small retry loop because of internal NNG latency
+  int retry = 0;
+  while ((res = imscope_try_send_data(data1, 0, num_samples, 1, 0,
+                                      timestamp)) == IMSCOPE_ERROR_BUSY &&
+         retry < 100) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    retry++;
+  }
   ASSERT_EQ(res, IMSCOPE_SUCCESS);
 
-  // 2. Verify scope 0 is busy
+  // 2. Verify scope 0 is busy (no request sent yet for second message)
   res = imscope_try_send_data(data1, 0, num_samples, 1, 0, timestamp);
   ASSERT_EQ(res, IMSCOPE_ERROR_BUSY);  // Busy
 
@@ -87,9 +98,12 @@ TEST(IntegrationTest, ProducerConsumerInprocMultiScope) {
   res = imscope_try_send_data(data2, 1, num_samples, 1, 0, timestamp);
   EXPECT_EQ(res, IMSCOPE_ERROR_BUSY);
 
-  // 7. Release messages (this should trigger REP)
+  // 7. Release messages and request more
   msg0.reset();
   msg1.reset();
+
+  consumer->request_data(0);
+  consumer->request_data(1);
 
   // Give some time for REPs to be processed
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -117,37 +131,44 @@ TEST(IntegrationTest, ZeroCopySend) {
   ImscopeConsumer* consumer = ImscopeConsumer::connect(announce_addr);
   ASSERT_NE(consumer, nullptr);
 
-  // Wait for discovery
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  // 1. Request data (synchronous REQ/REP)
+  consumer->request_data(0);
 
-  // Acquire buffer
+  // 2. Zero-copy send
+  void* buf = nullptr;
+  int retry = 0;
   size_t num_samples = 100;
-  void* buffer = imscope_acquire_send_buffer(0, num_samples);
-  ASSERT_NE(buffer, nullptr);
+  while ((buf = imscope_acquire_send_buffer(0, num_samples)) == nullptr &&
+         retry < 100) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    retry++;
+  }
+  ASSERT_NE(buf, nullptr);
 
-  // Fill buffer
-  uint32_t* data = static_cast<uint32_t*>(buffer);
-  for (size_t i = 0; i < num_samples; ++i)
-    data[i] = i;
+  uint32_t* iq_buf = (uint32_t*)buf;
+  for (size_t i = 0; i < num_samples; ++i) {
+    iq_buf[i] = i;
+  }
 
-  // Commit
-  rv = imscope_commit_send_buffer(0, num_samples, 123, 4, 1000);
-  ASSERT_EQ(rv, IMSCOPE_SUCCESS);
+  imscope_return_t res =
+      imscope_commit_send_buffer(0, num_samples, 10, 5, 2000);
+  ASSERT_EQ(res, IMSCOPE_SUCCESS);
 
   // Consume
   int handle = 0;
-  NngMsgPtr msg_ptr;
-  for (int i = 0; i < 40; ++i) {
-    msg_ptr = consumer->try_collect_scope_msg(0, handle);
-    if (msg_ptr)
-      break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  NngMsgPtr msg_ptr = nullptr;
+  retry = 0;
+  while ((msg_ptr = consumer->try_collect_scope_msg(0, handle)) == nullptr &&
+         retry < 100) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    retry++;
   }
   ASSERT_NE(msg_ptr, nullptr) << "Did not receive zero-copy message";
 
-  scope_msg_t* msg = static_cast<scope_msg_t*>(msg_ptr.get());
-  ASSERT_EQ(msg->meta.frame, 123);
-  ASSERT_EQ(msg->meta.slot, 4);
+  scope_msg_t* msg = (scope_msg_t*)msg_ptr.get();
+  ASSERT_EQ(msg->meta.frame, 10);
+  ASSERT_EQ(msg->meta.slot, 5);
+  ASSERT_EQ(msg->meta.timestamp, 2000);
   ASSERT_EQ(msg->data_size, num_samples * sizeof(uint32_t));
 
   uint32_t* recv_data = (uint32_t*)(msg + 1);

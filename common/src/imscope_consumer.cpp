@@ -18,119 +18,96 @@
 #include "imscope_common.h"
 #include "imscope_internal.h"
 
-class ContextWorker {
- public:
+struct ImscopeConsumer::ScopeCtx {
   nng_ctx ctx;
+  nng_aio* send_aio;
   nng_aio* recv_aio;
-  nng_aio* rep_aio;
-  ImscopeConsumer* parent;
 
-  ContextWorker(nng_socket socket, ImscopeConsumer* p) : parent(p) {
+  ScopeCtx(nng_socket socket) {
     nng_ctx_open(&ctx, socket);
-    nng_aio_alloc(&recv_aio, recv_callback, this);
-    nng_aio_alloc(&rep_aio, rep_callback, this);
+    nng_aio_alloc(&send_aio, NULL, NULL);
+    nng_aio_alloc(&recv_aio, NULL, NULL);
   }
 
-  ~ContextWorker() {
+  ~ScopeCtx() {
+    nng_aio_free(send_aio);
     nng_aio_free(recv_aio);
-    nng_aio_free(rep_aio);
     nng_ctx_close(ctx);
-  }
-
-  void start_recv() { nng_ctx_recv(ctx, recv_aio); }
-
-  static void recv_callback(void* arg) {
-    auto self = static_cast<ContextWorker*>(arg);
-    int rv = nng_aio_result(self->recv_aio);
-    if (rv != 0) {
-      if (rv != NNG_ECLOSED) {
-        spdlog::error("ImscopeConsumer: recv aio failed: {}", nng_strerror(rv));
-        self->start_recv();
-      }
-      return;
-    }
-
-    nng_msg* msg_obj = nng_aio_get_msg(self->recv_aio);
-    scope_msg_t* msg = (scope_msg_t*)nng_msg_body(msg_obj);
-    int scope_id = msg->id;
-
-    spdlog::debug(
-        "ImscopeConsumer: Received scope message for scope id {} (frame "
-        "{}, slot {})",
-        scope_id, msg->meta.frame, msg->meta.slot);
-
-    auto& buffer = *self->parent->scope_buffers[scope_id];
-    std::unique_lock<std::mutex> lock(buffer.mutex, std::try_to_lock);
-    if (!lock.owns_lock()) {
-      spdlog::warn(
-          "ImscopeConsumer: Buffer busy for scope {}, discarding message",
-          scope_id);
-      nng_msg_free(msg_obj);
-      return;
-    }
-
-    if (buffer.msg != nullptr) {
-      spdlog::warn(
-          "ImscopeConsumer: Buffer full for scope {}, discarding message",
-          scope_id);
-      nng_msg_free(msg_obj);
-      return;
-    }
-
-    buffer.msg = make_nng_msg_ptr(msg_obj, self);
-    buffer.version++;
-  }
-
-  static void rep_callback(void* arg) {
-    auto self = static_cast<ContextWorker*>(arg);
-    int rv = nng_aio_result(self->rep_aio);
-    if (rv != 0) {
-      spdlog::error("ImscopeConsumer: rep aio failed: {}", nng_strerror(rv));
-    }
-    // Successfully sent REP, now wait for next REQ
-    self->start_recv();
-  }
-
-  void send_rep() {
-    nng_msg* ack;
-    nng_msg_alloc(&ack, 0);
-    nng_aio_set_msg(rep_aio, ack);
-    nng_ctx_send(ctx, rep_aio);
   }
 };
 
-NngMsgPtr make_nng_msg_ptr(nng_msg* msg, ContextWorker* worker) {
+NngMsgPtr make_nng_msg_ptr(nng_msg* msg) {
   if (!msg)
     return nullptr;
-  return NngMsgPtr(nng_msg_body(msg), [msg, worker](void*) {
-    nng_msg_free(msg);
-    worker->send_rep();
-  });
+  return NngMsgPtr(nng_msg_body(msg), [msg](void*) { nng_msg_free(msg); });
 }
 
-ImscopeConsumer::ImscopeConsumer(const char* data_address,
-                                 const char* announce_address, int num_scopes,
+ImscopeConsumer::ImscopeConsumer(const char* data_address, int num_scopes,
                                  imscope_scope_config_t* scopes,
                                  const char* name)
     : data_address(data_address),
-      announce_address(announce_address),
       configured_scopes(scopes, scopes + num_scopes),
       name(name) {
-  for (int i = 0; i < configured_scopes.size(); i++) {
-    scope_buffers.push_back(std::make_unique<ScopeBuffer>());
-  }
+  this->data_socket = create_nng_req_socket(data_address);
 
-  this->data_socket = create_nng_rep_socket(data_address);
-
-  // Create twice as many workers as scopes to handle potential overlaps
-  for (int i = 0; i < num_scopes * 2; i++) {
-    auto worker = std::make_unique<ContextWorker>(this->data_socket, this);
-    worker->start_recv();
-    workers.push_back(std::move(worker));
+  for (size_t i = 0; i < configured_scopes.size(); i++) {
+    scope_contexts.push_back(std::make_unique<ScopeCtx>(this->data_socket));
   }
 }
 
-ImscopeConsumer::~ImscopeConsumer() {}
+ImscopeConsumer::~ImscopeConsumer() {
+  nng_close(data_socket);
+}
+
+imscope_return_t ImscopeConsumer::request_data(int scope_id) {
+  if (scope_id >= (int)scope_contexts.size()) {
+    return IMSCOPE_ERROR_INVALID_ID;
+  }
+  auto& sc = scope_contexts[scope_id];
+
+  // Only allow request if we are not already waiting for one
+  if (nng_aio_result(sc->recv_aio) == -1) {
+    return IMSCOPE_SUCCESS;
+  }
+
+  nng_msg* msg;
+  nng_msg_alloc(&msg, sizeof(scope_request_t));
+  scope_request_t* req = (scope_request_t*)nng_msg_body(msg);
+  req->magic = SCOPE_REQ_MSG_ID;
+  req->scope_id = scope_id;
+
+  nng_aio_set_msg(sc->send_aio, msg);
+  nng_ctx_send(sc->ctx, sc->send_aio);
+  nng_aio_wait(sc->send_aio);
+
+  // Restart recv immediately to wait for the response
+  nng_ctx_recv(sc->ctx, sc->recv_aio);
+  return IMSCOPE_SUCCESS;
+}
+
+NngMsgPtr ImscopeConsumer::try_collect_scope_msg(int scope_id, int& version) {
+  if (scope_id >= (int)scope_contexts.size()) {
+    return nullptr;
+  }
+  auto& sc = scope_contexts[scope_id];
+
+  // Check if REQ is ready
+  // nng_aio_result returns -1 (NNG_EINPROGRESS) if the operation is still pending.
+  // If it's 0, it means the previous recv completed. If it's anything else, it's an error.
+  int rv = nng_aio_result(sc->recv_aio);
+  if (rv == -1) {  // In progress, no message yet
+    return nullptr;
+  } else if (rv != 0) {  // An error occurred
+    spdlog::error(
+        "ImscopeConsumer: nng_aio_result on recv_aio returned error: {}",
+        nng_strerror(rv));
+    return nullptr;
+  }
+
+  nng_msg* msg = nng_aio_get_msg(sc->recv_aio);
+  version++;
+  return make_nng_msg_ptr(msg);
+}
 
 ImscopeConsumer* ImscopeConsumer::connect(const char* announce_address) {
   nng_socket req_sock;
@@ -166,26 +143,56 @@ ImscopeConsumer* ImscopeConsumer::connect(const char* announce_address) {
 
   announce_response_t* response = (announce_response_t*)nng_msg_body(res_msg);
   print_announce_response(response);
-  auto consumer = new ImscopeConsumer(response->data_address, announce_address,
-                                      response->num_scopes, response->scopes,
-                                      response->name);
+  auto consumer =
+      new ImscopeConsumer(response->data_address, response->num_scopes,
+                          response->scopes, response->name);
   nng_msg_free(res_msg);
   nng_close(req_sock);
   return consumer;
 }
 
-NngMsgPtr ImscopeConsumer::try_collect_scope_msg(int scope_id, int& version) {
-  auto& buffer = *scope_buffers[scope_id];
-  std::unique_lock<std::mutex> lock(buffer.mutex);
-  if (buffer.msg != nullptr && version != buffer.version) {
-    version = buffer.version;
-    NngMsgPtr msg = std::move(buffer.msg);
-    buffer.msg = nullptr;
-    return msg;
+bool ImscopeConsumer::try_collect_iq(int scope_id, std::vector<int16_t>& real,
+                                     std::vector<int16_t>& imag) {
+  int version = 0;
+  auto msg_ptr = try_collect_scope_msg(scope_id, version);
+  if (!msg_ptr) {
+    return false;
   }
-  return nullptr;
+
+  scope_msg_t* msg = static_cast<scope_msg_t*>(msg_ptr.get());
+  size_t num_samples = msg->data_size / 4;  // Assuming 32-bit (16+16) samples
+  uint32_t* data = reinterpret_cast<uint32_t*>(msg + 1);
+
+  real.clear();
+  imag.clear();
+  real.reserve(num_samples);
+  imag.reserve(num_samples);
+
+  for (size_t i = 0; i < num_samples; ++i) {
+    real.push_back(static_cast<int16_t>(data[i] & 0xFFFF));
+    imag.push_back(static_cast<int16_t>((data[i] >> 16) & 0xFFFF));
+  }
+
+  return true;
 }
 
-void ImscopeConsumer::free(scope_msg_t* msg) {
-  // Handled by NngMsgPtr deleter
+bool ImscopeConsumer::try_collect_real(int scope_id,
+                                       std::vector<int16_t>& real) {
+  int version = 0;
+  auto msg_ptr = try_collect_scope_msg(scope_id, version);
+  if (!msg_ptr) {
+    return false;
+  }
+
+  scope_msg_t* msg = static_cast<scope_msg_t*>(msg_ptr.get());
+  size_t num_samples = msg->data_size / 2;
+  int16_t* data = reinterpret_cast<int16_t*>(msg + 1);
+
+  real.clear();
+  real.reserve(num_samples);
+  for (size_t i = 0; i < num_samples; ++i) {
+    real.push_back(data[i]);
+  }
+
+  return true;
 }
