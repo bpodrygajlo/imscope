@@ -16,38 +16,29 @@
 
 #include "imscope_common.h"
 
-class ContextWorker;
+class ImscopeConsumer;
 using NngMsgPtr = std::shared_ptr<void>;
 
-NngMsgPtr make_nng_msg_ptr(nng_msg* msg, ContextWorker* worker);
+NngMsgPtr make_nng_msg_ptr(nng_msg* msg);
 
 class ImscopeConsumer {
-  friend class ContextWorker;
-
-  struct ScopeBuffer {
-    NngMsgPtr msg;
-    std::mutex mutex;
-    int version = 0;
-    ScopeBuffer() = default;
-    ScopeBuffer(const ScopeBuffer&) = delete;
-    ScopeBuffer& operator=(const ScopeBuffer&) = delete;
-  };
-
   std::string data_address;
   std::string announce_address;
   nng_socket data_socket;
-  std::vector<std::unique_ptr<ScopeBuffer>> scope_buffers;
 
+  struct ScopeCtx;
   std::vector<imscope_scope_config_t> configured_scopes;
-  std::vector<std::unique_ptr<ContextWorker>> workers;
+  std::vector<std::unique_ptr<ScopeCtx>> scope_contexts;
   std::string name;
 
  public:
-  ImscopeConsumer(const char* data_address, const char* announce_address,
-                  int num_scopes, imscope_scope_config_t* scopes,
-                  const char* name);
+  ImscopeConsumer(const char* data_address, int num_scopes,
+                  imscope_scope_config_t* scopes, const char* name);
   ~ImscopeConsumer();
+
+  imscope_return_t request_data(int scope_id);
   NngMsgPtr try_collect_scope_msg(int scope_id, int& handle);
+
   bool try_collect_iq(int scope_id, std::vector<int16_t>& real,
                       std::vector<int16_t>& imag);
   bool try_collect_real(int scope_id, std::vector<int16_t>& real);
@@ -60,6 +51,4 @@ class ImscopeConsumer {
   }
 
   int get_num_scopes() const { return configured_scopes.size(); }
-
-  static void free(scope_msg_t* msg);
 };

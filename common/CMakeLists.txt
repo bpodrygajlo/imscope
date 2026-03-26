@@ -33,17 +33,7 @@ target_include_directories(imscope_tools PUBLIC include/)
 target_link_libraries(imscope_tools PUBLIC spdlog)
 
 if(IMSCOPE_BUILD_TESTS)
-  enable_testing()
-  add_executable(imscope_integration_test test/integration_test.cpp)
-  target_link_libraries(imscope_integration_test
-      PRIVATE
-      imscope_producer
-      imscope_consumer
-      imscope_internal
-      GTest::gtest_main
-  )
-  include(GoogleTest)
-  gtest_discover_tests(imscope_integration_test)
+  add_subdirectory(test)
 endif()
 
 if(IMSCOPE_BUILD_EXAMPLES)

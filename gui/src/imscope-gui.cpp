@@ -67,6 +67,7 @@ typedef struct {
   float noise_cutoff_percentage = 50.0f;
   int handle = 0;
   bool collecting = false;
+  bool requested_data = false;
 } scope_window_t;
 
 static std::map<std::pair<ImscopeConsumer*, int>, scope_window_t> scope_windows;
@@ -134,29 +135,35 @@ void show_scope_window(scope_window_t& scope_window) {
                      100000);
   }
 
-  bool collect = true;
   if (!scope_window.auto_collect) {
+    ImGui::BeginDisabled(scope_window.requested_data);
     if (ImGui::Button("Request data")) {
-      collect = true;
+      scope_window.consumer->request_data(scope_window.scope_id);
+      scope_window.requested_data = true;
     }
-    collect = false;
+    ImGui::EndDisabled();
+  } else {
+    if (!scope_window.requested_data) {
+      scope_window.consumer->request_data(scope_window.scope_id);
+      scope_window.requested_data = true;
+    }
   }
-  if (collect) {
-    auto msg = scope_window.consumer->try_collect_scope_msg(
-        scope_window.scope_id, scope_window.handle);
-    if (msg.get() != nullptr) {
-      if (scope_window.filter_enabled) {
-        if (scope_window.iq_data.read_scope_msg(
-                static_cast<scope_msg_t*>(msg.get()),
-                scope_window.noise_cutoff_linear,
-                scope_window.noise_cutoff_percentage)) {
-          fit = true;
-        }
-      } else {
-        scope_window.iq_data.read_scope_msg(
-            static_cast<scope_msg_t*>(msg.get()), scope_window.collecting);
-        ImPlot::SetNextAxesToFit();
+
+  auto msg = scope_window.consumer->try_collect_scope_msg(
+      scope_window.scope_id, scope_window.handle);
+  if (msg.get() != nullptr) {
+    scope_window.requested_data = false;
+    if (scope_window.filter_enabled) {
+      if (scope_window.iq_data.read_scope_msg(
+              static_cast<scope_msg_t*>(msg.get()),
+              scope_window.noise_cutoff_linear,
+              scope_window.noise_cutoff_percentage)) {
+        fit = true;
       }
+    } else {
+      scope_window.iq_data.read_scope_msg(
+          static_cast<scope_msg_t*>(msg.get()), scope_window.collecting);
+      ImPlot::SetNextAxesToFit();
     }
   }
 
@@ -430,6 +437,6 @@ void imscope_thread(void) {
 }
 
 int main(int argc, char** argv) {
-  spdlog::set_level(spdlog::level::info);
+  spdlog::set_level(spdlog::level::debug);
   imscope_thread();
 }

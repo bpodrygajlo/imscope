@@ -31,6 +31,7 @@ typedef enum {
   IMSCOPE_ERROR_NOT_INITIALIZED = -1,
   IMSCOPE_ERROR_INVALID_ID = -2,
   IMSCOPE_ERROR_BUSY = -3,
+  IMSCOPE_ERROR_INTERNAL = -4,
 } imscope_return_t;
 
 typedef enum {
@@ -67,5 +68,12 @@ typedef struct {
 typedef struct {
   uint32_t magic;
 } announce_request_t;
+
+#define SCOPE_REQ_MSG_ID 0xABCDEF02
+
+typedef struct {
+  uint32_t magic;
+  int32_t scope_id;
+} scope_request_t;
 
 #endif
