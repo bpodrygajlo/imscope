@@ -109,9 +109,6 @@ To visualize data from your application, you need to use the `imscope` producer 
 
 ## License
 
-This project uses a hybrid licensing model:
+This project is licensed under the **MIT License**. This allows for easy integration and modification for both open-source and proprietary applications.
 
-*   **Producer Library (`common/`):** Licensed under the **MIT License**. This allows for easy integration into high-performance 5G stacks and other proprietary or open-source applications.
-*   **GUI Application (`gui/`):** Licensed under the **GNU Affero General Public License v3.0 (AGPLv3)**. This ensures that the visualization tool itself remains open-source and benefits the community.
-
-See the [LICENSE](LICENSE) file for more details. For commercial licensing of the GUI, please contact the maintainers.
+See the [LICENSE](LICENSE) file for the full license text.
