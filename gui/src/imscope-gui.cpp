@@ -86,8 +86,21 @@ void show_scope_window(scope_window_t& scope_window) {
   ImGui::Begin((scope_window.consumer->get_name() + " - Scope " +
                 scope_window.consumer->get_scope_name(scope_window.scope_id))
                    .c_str());
-  if (ImGui::Checkbox("Automatically collect data",
-                      &scope_window.auto_collect)) {}
+  ImGui::Checkbox("Automatically collect data", &scope_window.auto_collect);
+
+  if (!scope_window.auto_collect) {
+    ImGui::BeginDisabled(scope_window.requested_data);
+    if (ImGui::Button("Request data")) {
+      scope_window.consumer->request_data(scope_window.scope_id);
+      scope_window.requested_data = true;
+    }
+    ImGui::EndDisabled();
+  } else {
+    if (!scope_window.requested_data) {
+      scope_window.consumer->request_data(scope_window.scope_id);
+      scope_window.requested_data = true;
+    }
+  }
 
   bool fit = false;
   ImGui::Checkbox("Enable ingress filtering", &scope_window.filter_enabled);
@@ -111,31 +124,6 @@ void show_scope_window(scope_window_t& scope_window) {
       ImGui::SetTooltip(
           "What percentage of samples can be noise before rejecting the entire "
           "scope message");
-    }
-  }
-  ImGui::Checkbox("Enable collecting by timestamp", &scope_window.collecting);
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip(
-        "Collect incoming data by scope message timestamp. This will stack "
-        "samples in order of timestamp.");
-  }
-  if (scope_window.collecting) {
-    ImGui::SliderInt("Size of stacked data",
-                     (int*)&scope_window.iq_data.max_stacked_size, 1000,
-                     100000);
-  }
-
-  if (!scope_window.auto_collect) {
-    ImGui::BeginDisabled(scope_window.requested_data);
-    if (ImGui::Button("Request data")) {
-      scope_window.consumer->request_data(scope_window.scope_id);
-      scope_window.requested_data = true;
-    }
-    ImGui::EndDisabled();
-  } else {
-    if (!scope_window.requested_data) {
-      scope_window.consumer->request_data(scope_window.scope_id);
-      scope_window.requested_data = true;
     }
   }
 
