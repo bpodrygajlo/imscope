@@ -63,9 +63,9 @@ nng_socket create_nng_req_socket(const char* address) {
     FatalError("nng_req0_open failed: %s", nng_strerror(rv));
   }
 
-  rv = nng_listen(socket, address, NULL, 0);
+  rv = nng_dial(socket, address, NULL, NNG_FLAG_NONBLOCK);
   if (rv != 0) {
-    FatalError("nng_listen failed address %s: %s", address, nng_strerror(rv));
+    FatalError("nng_dial failed: %s", nng_strerror(rv));
   }
   return socket;
 }
@@ -77,9 +77,9 @@ nng_socket create_nng_rep_socket(const char* address) {
     FatalError("nng_rep0_open failed: %s", nng_strerror(rv));
   }
 
-  rv = nng_dial(socket, address, NULL, NNG_FLAG_NONBLOCK);
+  rv = nng_listen(socket, address, NULL, 0);
   if (rv != 0) {
-    FatalError("nng_dial failed: %s", nng_strerror(rv));
+    FatalError("nng_listen failed address %s: %s", address, nng_strerror(rv));
   }
   return socket;
 }

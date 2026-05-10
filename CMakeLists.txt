@@ -13,8 +13,14 @@ project(imscope_workspace)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-option(IMSCOPE_BUILD_TESTS "Build tests" ON)
+option(IMSCOPE_BUILD_TESTS "Build tests" OFF)
+if (IMSCOPE_BUILD_TESTS)
+    enable_testing()
+endif()
+
 option(IMSCOPE_BUILD_EXAMPLES "Build examples" ON)
+
+
 option(IMSCOPE_BUILD_GUI "Build GUI" ON)
 
 if(NOT DEFINED ENV{CPM_SOURCE_CACHE})

@@ -1,4 +1,4 @@
-# imscope - AI Agent Context (Jules/Gemini)
+# imscope - AI Agent Context
 
 `imscope` is a real-time signal visualization tool designed for high-throughput IQ data (e.g., 5G stacks). It utilizes **NNG** for communication and **Dear ImGui** with **ImPlot** for the graphical interface.
 

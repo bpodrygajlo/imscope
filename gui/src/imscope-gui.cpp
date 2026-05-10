@@ -1,18 +1,8 @@
 /*
  * Copyright (c) 2025-2026 Bartosz Podrygajlo
  *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ * Licensed under the MIT License.
+ * See LICENSE file in the project root for full license information.
  */
 
 #include <stdio.h>
@@ -67,6 +57,7 @@ typedef struct {
   float noise_cutoff_percentage = 50.0f;
   int handle = 0;
   bool collecting = false;
+  bool requested_data = false;
 } scope_window_t;
 
 static std::map<std::pair<ImscopeConsumer*, int>, scope_window_t> scope_windows;
@@ -95,8 +86,21 @@ void show_scope_window(scope_window_t& scope_window) {
   ImGui::Begin((scope_window.consumer->get_name() + " - Scope " +
                 scope_window.consumer->get_scope_name(scope_window.scope_id))
                    .c_str());
-  if (ImGui::Checkbox("Automatically collect data",
-                      &scope_window.auto_collect)) {}
+  ImGui::Checkbox("Automatically collect data", &scope_window.auto_collect);
+
+  if (!scope_window.auto_collect) {
+    ImGui::BeginDisabled(scope_window.requested_data);
+    if (ImGui::Button("Request data")) {
+      scope_window.consumer->request_data(scope_window.scope_id);
+      scope_window.requested_data = true;
+    }
+    ImGui::EndDisabled();
+  } else {
+    if (!scope_window.requested_data) {
+      scope_window.consumer->request_data(scope_window.scope_id);
+      scope_window.requested_data = true;
+    }
+  }
 
   bool fit = false;
   ImGui::Checkbox("Enable ingress filtering", &scope_window.filter_enabled);
@@ -122,41 +126,22 @@ void show_scope_window(scope_window_t& scope_window) {
           "scope message");
     }
   }
-  ImGui::Checkbox("Enable collecting by timestamp", &scope_window.collecting);
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip(
-        "Collect incoming data by scope message timestamp. This will stack "
-        "samples in order of timestamp.");
-  }
-  if (scope_window.collecting) {
-    ImGui::SliderInt("Size of stacked data",
-                     (int*)&scope_window.iq_data.max_stacked_size, 1000,
-                     100000);
-  }
 
-  bool collect = true;
-  if (!scope_window.auto_collect) {
-    if (ImGui::Button("Request data")) {
-      collect = true;
-    }
-    collect = false;
-  }
-  if (collect) {
-    auto msg = scope_window.consumer->try_collect_scope_msg(
-        scope_window.scope_id, scope_window.handle);
-    if (msg.get() != nullptr) {
-      if (scope_window.filter_enabled) {
-        if (scope_window.iq_data.read_scope_msg(
-                static_cast<scope_msg_t*>(msg.get()),
-                scope_window.noise_cutoff_linear,
-                scope_window.noise_cutoff_percentage)) {
-          fit = true;
-        }
-      } else {
-        scope_window.iq_data.read_scope_msg(
-            static_cast<scope_msg_t*>(msg.get()), scope_window.collecting);
-        ImPlot::SetNextAxesToFit();
+  auto msg = scope_window.consumer->try_collect_scope_msg(scope_window.scope_id,
+                                                          scope_window.handle);
+  if (msg.get() != nullptr) {
+    scope_window.requested_data = false;
+    if (scope_window.filter_enabled) {
+      if (scope_window.iq_data.read_scope_msg(
+              static_cast<scope_msg_t*>(msg.get()),
+              scope_window.noise_cutoff_linear,
+              scope_window.noise_cutoff_percentage)) {
+        fit = true;
       }
+    } else {
+      scope_window.iq_data.read_scope_msg(static_cast<scope_msg_t*>(msg.get()),
+                                          scope_window.collecting);
+      ImPlot::SetNextAxesToFit();
     }
   }
 
@@ -430,6 +415,6 @@ void imscope_thread(void) {
 }
 
 int main(int argc, char** argv) {
-  spdlog::set_level(spdlog::level::info);
+  spdlog::set_level(spdlog::level::debug);
   imscope_thread();
 }
