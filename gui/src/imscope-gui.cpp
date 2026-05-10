@@ -127,8 +127,8 @@ void show_scope_window(scope_window_t& scope_window) {
     }
   }
 
-  auto msg = scope_window.consumer->try_collect_scope_msg(
-      scope_window.scope_id, scope_window.handle);
+  auto msg = scope_window.consumer->try_collect_scope_msg(scope_window.scope_id,
+                                                          scope_window.handle);
   if (msg.get() != nullptr) {
     scope_window.requested_data = false;
     if (scope_window.filter_enabled) {
@@ -139,8 +139,8 @@ void show_scope_window(scope_window_t& scope_window) {
         fit = true;
       }
     } else {
-      scope_window.iq_data.read_scope_msg(
-          static_cast<scope_msg_t*>(msg.get()), scope_window.collecting);
+      scope_window.iq_data.read_scope_msg(static_cast<scope_msg_t*>(msg.get()),
+                                          scope_window.collecting);
       ImPlot::SetNextAxesToFit();
     }
   }
