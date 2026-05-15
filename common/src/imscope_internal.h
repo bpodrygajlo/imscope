@@ -10,7 +10,6 @@
 
 void FatalError(const char* format, ...);
 nng_socket create_nng_push_socket(const char* address);
-nng_socket create_nng_pull_socket(const char* address);
 nng_socket create_nng_req_socket(const char* address);
 nng_socket create_nng_rep_socket(const char* address);
 void print_announce_response(announce_response_t* msg);

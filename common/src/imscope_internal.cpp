@@ -6,7 +6,6 @@
  */
 
 #include <nng/nng.h>
-#include <nng/protocol/pipeline0/pull.h>
 #include <nng/protocol/pipeline0/push.h>
 #include <nng/protocol/reqrep0/rep.h>
 #include <nng/protocol/reqrep0/req.h>
@@ -38,20 +37,6 @@ nng_socket create_nng_push_socket(const char* address) {
   rv = nng_listen(socket, address, NULL, 0);
   if (rv != 0) {
     FatalError("nng_listen failed address %s: %s", address, nng_strerror(rv));
-  }
-  return socket;
-}
-
-nng_socket create_nng_pull_socket(const char* address) {
-  nng_socket socket;
-  int rv = nng_pull0_open(&socket);
-  if (rv != 0) {
-    FatalError("nng_pull0_open failed: %s", nng_strerror(rv));
-  }
-
-  rv = nng_dial(socket, address, NULL, NNG_FLAG_NONBLOCK);
-  if (rv != 0) {
-    FatalError("nng_dial failed: %s", nng_strerror(rv));
   }
   return socket;
 }
