@@ -369,7 +369,6 @@ void imscope_thread(void) {
     int display_w, display_h;
     glfwGetFramebufferSize(window, &display_w, &display_h);
 
-    static float t = 0;
     static bool show_imgui_demo_window = false;
     static bool show_implot_demo_window = false;
     ImGui::DockSpaceOverViewport();
