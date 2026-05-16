@@ -58,6 +58,7 @@ typedef struct {
   int handle = 0;
   bool collecting = false;
   bool requested_data = false;
+  std::string title;
 } scope_window_t;
 
 static std::map<std::pair<ImscopeConsumer*, int>, scope_window_t> scope_windows;
@@ -83,9 +84,7 @@ void show_metadata(const NRmetadata& meta) {
 }
 
 void show_scope_window(scope_window_t& scope_window) {
-  ImGui::Begin((scope_window.consumer->get_name() + " - Scope " +
-                scope_window.consumer->get_scope_name(scope_window.scope_id))
-                   .c_str());
+  ImGui::Begin(scope_window.title.c_str());
   ImGui::Checkbox("Automatically collect data", &scope_window.auto_collect);
 
   if (!scope_window.auto_collect) {
@@ -257,8 +256,17 @@ void show_consumers() {
         std::make_pair(consumers[selected].consumer, selected_scope);
     if (scope_windows.count(selected_pair) == 0) {
       if (ImGui::Button("Open scope window")) {
+        std::string title =
+            consumers[selected].consumer->get_name() + " - Scope " +
+            consumers[selected].consumer->get_scope_name(selected_scope);
         scope_windows[selected_pair] = {
-            selected_scope, consumers[selected].consumer, IQSnapshot()};
+            selected_scope, consumers[selected].consumer,
+            IQSnapshot(),   0,
+            IQHistogram(),  false,
+            false,          0.0f,
+            50.0f,          0,
+            false,          false,
+            title};
       }
     } else {
       if (ImGui::Button("Close scope window")) {
