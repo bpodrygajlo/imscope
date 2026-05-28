@@ -126,6 +126,19 @@ void show_scope_window(scope_window_t& scope_window) {
     }
   }
 
+  ImGui::Checkbox("Enable collecting by timestamp", &scope_window.collecting);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip(
+        "Collect incoming data by scope message timestamp. This will stack "
+        "samples in order of timestamp.");
+  }
+  if (scope_window.collecting) {
+    int max_size = static_cast<int>(scope_window.iq_data.max_stacked_size);
+    if (ImGui::SliderInt("Size of stacked data", &max_size, 1000, 100000)) {
+      scope_window.iq_data.max_stacked_size = max_size;
+    }
+  }
+
   auto msg = scope_window.consumer->try_collect_scope_msg(scope_window.scope_id,
                                                           scope_window.handle);
   if (msg.get() != nullptr) {
