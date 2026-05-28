@@ -301,6 +301,12 @@ void show_consumers() {
       printf("Failed to connect to consumer at address %s\n", buf);
     }
   }
+  ImGui::SameLine();
+  if (ImGui::Button("Refresh Scopes")) {
+    for (auto& entry : consumers) {
+      entry.consumer->refresh_scopes();
+    }
+  }
   ImGui::End();
 }
 

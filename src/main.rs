@@ -229,6 +229,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app_state.status_message = format!("Worker error: {}", err);
                     app_state.status_msg_time = Some(Instant::now());
                 }
+                WorkerEvent::ScopesRefreshed { scopes } => {
+                    if let ConnectionState::Connected {
+                        scopes: ref mut ref_mut_scopes,
+                        ..
+                    } = app_state.connection
+                    {
+                        *ref_mut_scopes = scopes.clone();
+                        app_state.status_message = "Scopes refreshed successfully!".to_string();
+
+                        // Keep selected_scope_idx within bounds
+                        if !scopes.is_empty() {
+                            if app_state.selected_scope_idx >= scopes.len() {
+                                app_state.selected_scope_idx = 0;
+                            }
+                            app_state
+                                .scope_list_state
+                                .select(Some(app_state.selected_scope_idx));
+
+                            let scope = &scopes[app_state.selected_scope_idx];
+                            let _ = cmd_tx.send(WorkerCommand::SelectScope {
+                                scope_id: app_state.selected_scope_idx,
+                                scope_type: scope.scope_type,
+                            });
+                        } else {
+                            app_state.scope_list_state.select(None);
+                            app_state.active_snapshot = None;
+                        }
+                    } else {
+                        app_state.status_message =
+                            "Scopes refreshed, but not connected.".to_string();
+                    }
+                    app_state.status_msg_time = Some(Instant::now());
+                }
             }
         }
 
@@ -361,6 +394,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 KeyCode::Char('r') => {
                                     let _ = cmd_tx.send(WorkerCommand::RequestSingleFrame);
+                                }
+                                KeyCode::Char('R') => {
+                                    app_state.status_message = "Refreshing scopes...".to_string();
+                                    app_state.status_msg_time = Some(Instant::now());
+                                    let _ = cmd_tx.send(WorkerCommand::RefreshScopes);
                                 }
                                 KeyCode::Char('f') => {
                                     app_state.filter_enabled = !app_state.filter_enabled;
@@ -505,7 +543,7 @@ fn draw_ui(frame: &mut Frame, state: &mut AppState) {
     draw_plot_area(frame, content_chunks[1], state);
 
     // Render Status Bar
-    let shortcut_text = "q: Quit | i: Edit URL | c: Connect | a: Auto Collect | r: Request Single | f: Toggle Filter";
+    let shortcut_text = "q: Quit | i: Edit URL | c: Connect | R: Refresh | a: Auto Collect | r: Request Single | f: Toggle Filter";
     let status_paragraph = Paragraph::new(Line::from(vec![
         Span::styled(
             " [KEYS] ",
@@ -588,6 +626,16 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 "Press 'i' to edit connection URL"
             })
             .fg(Color::DarkGray),
+        ]),
+        Line::from(vec![
+            Span::raw("Press "),
+            Span::styled(
+                "R",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" to refresh scopes").fg(Color::DarkGray),
         ]),
     ];
 
@@ -1133,6 +1181,10 @@ fn handle_mouse_click(
             let _ = cmd_tx.send(WorkerCommand::Connect {
                 url: state.announce_url.clone(),
             });
+        } else if row == conn.y + 4 {
+            state.status_message = "Refreshing scopes...".to_string();
+            state.status_msg_time = Some(Instant::now());
+            let _ = cmd_tx.send(WorkerCommand::RefreshScopes);
         }
         return;
     }
@@ -1294,5 +1346,22 @@ mod tests {
         handle_mouse_click(81, 4, area, &mut state, &tx);
 
         assert_eq!(state.active_tab, AppTab::Waveform);
+    }
+
+    #[test]
+    fn test_handle_mouse_click_refresh() {
+        let mut state = AppState::new("tcp://127.0.0.1:5557".to_string());
+        let (tx, rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 120, 35);
+
+        handle_mouse_click(5, 7, area, &mut state, &tx);
+
+        // Check that command was sent
+        let cmd = rx.try_recv().unwrap();
+        match cmd {
+            WorkerCommand::RefreshScopes => {}
+            _ => panic!("Expected RefreshScopes command"),
+        }
+        assert_eq!(state.status_message, "Refreshing scopes...");
     }
 }

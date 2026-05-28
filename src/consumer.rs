@@ -350,6 +350,7 @@ pub enum WorkerCommand {
         cutoff: f32,
         percentage: f32,
     },
+    RefreshScopes,
 }
 
 // Events from Worker to TUI thread
@@ -367,12 +368,16 @@ pub enum WorkerEvent {
         msg: ScopeMessage,
     },
     Error(String),
+    ScopesRefreshed {
+        scopes: Vec<ScopeConfig>,
+    },
 }
 
 pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>) {
     let mut data_socket: Option<Socket> = None;
     let mut selected_scope: Option<(usize, ScopeType)> = None;
     let mut auto_collect = true;
+    let mut announce_url: Option<String> = None;
 
     let mut filter_enabled = false;
     let mut filter_cutoff = 0.0f32;
@@ -392,6 +397,7 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
         if let Some(command) = cmd {
             match command {
                 WorkerCommand::Connect { url } => {
+                    announce_url = Some(url.clone());
                     let _ = event_tx.send(WorkerEvent::Connecting);
                     match perform_announce(&url) {
                         Ok(ann) => {
@@ -480,6 +486,22 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
                     filter_enabled = enabled;
                     filter_cutoff = cutoff;
                     filter_percentage = percentage;
+                }
+                WorkerCommand::RefreshScopes => {
+                    if let Some(ref url) = announce_url {
+                        match perform_announce(url) {
+                            Ok(ann) => {
+                                let _ = event_tx
+                                    .send(WorkerEvent::ScopesRefreshed { scopes: ann.scopes });
+                            }
+                            Err(e) => {
+                                let _ = event_tx.send(WorkerEvent::Error(format!(
+                                    "Failed to refresh scopes: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    }
                 }
             }
         }

@@ -117,6 +117,7 @@ class ImscopeProducer {
         if (nng_msg_len(req_msg) >= sizeof(announce_request_t)) {
           announce_request_t* req = (announce_request_t*)nng_msg_body(req_msg);
           if (req->magic == ANNOUNCE_MSG_ID) {
+            std::lock_guard<std::mutex> lock(self->parent->scopes_mutex);
             size_t size = sizeof(announce_response_t) +
                           self->parent->configured_scopes.size() *
                               sizeof(imscope_scope_config_t);
@@ -164,6 +165,8 @@ class ImscopeProducer {
   std::unique_ptr<AnnounceCtx> announce_handler;
   std::map<int, ScopeCtx*> active_requests;
   std::mutex active_requests_mutex;
+  std::mutex scopes_mutex;
+  std::mutex acquired_msgs_mutex;
 
  public:
   ImscopeProducer() {}
@@ -183,7 +186,10 @@ class ImscopeProducer {
     }
   }
 
-  void clear_scopes() { configured_scopes.clear(); }
+  void clear_scopes() {
+    std::lock_guard<std::mutex> lock(scopes_mutex);
+    configured_scopes.clear();
+  }
 
   void connect(const char* data_address, const char* announce_address,
                const char* name) {
@@ -204,7 +210,9 @@ class ImscopeProducer {
 
     this->data_socket = create_nng_rep_socket(data_address);
 
-    for (size_t i = 0; i < configured_scopes.size(); i++) {
+    std::lock_guard<std::mutex> lock(scopes_mutex);
+    size_t num_workers = std::max((size_t)8, configured_scopes.size());
+    for (size_t i = 0; i < num_workers; i++) {
       workers.push_back(std::make_unique<ScopeCtx>(this->data_socket, this));
     }
 
@@ -221,9 +229,43 @@ class ImscopeProducer {
   }
 
   imscope_return_t add_scope(const char* name, scope_type_t type) {
+    std::lock_guard<std::mutex> lock(scopes_mutex);
+    for (size_t i = 0; i < configured_scopes.size(); i++) {
+      if (configured_scopes[i].name == name) {
+        return IMSCOPE_SUCCESS;
+      }
+    }
     scope_info_t scope_info = {name, type};
     configured_scopes.push_back(scope_info);
+    if (nng_socket_id(data_socket) > 0) {
+      workers.push_back(std::make_unique<ScopeCtx>(this->data_socket, this));
+    }
     return IMSCOPE_SUCCESS;
+  }
+
+  int get_or_register_scope(const char* name, scope_type_t type) {
+    std::lock_guard<std::mutex> lock(scopes_mutex);
+    for (size_t i = 0; i < configured_scopes.size(); i++) {
+      if (configured_scopes[i].name == name) {
+        return static_cast<int>(i);
+      }
+    }
+    scope_info_t scope_info = {name, type};
+    configured_scopes.push_back(scope_info);
+    if (nng_socket_id(data_socket) > 0) {
+      workers.push_back(std::make_unique<ScopeCtx>(this->data_socket, this));
+    }
+    return static_cast<int>(configured_scopes.size() - 1);
+  }
+
+  int get_scope_id_by_name(const char* name) {
+    std::lock_guard<std::mutex> lock(scopes_mutex);
+    for (size_t i = 0; i < configured_scopes.size(); i++) {
+      if (configured_scopes[i].name == name) {
+        return static_cast<int>(i);
+      }
+    }
+    return -1;
   }
 
   imscope_return_t send_scope_data(uint32_t* data, int id, size_t num_samples,
@@ -299,13 +341,19 @@ class ImscopeProducer {
     }
 
     size_t size = sizeof(scope_msg_t) + sizeof(uint32_t) * num_samples;
-    if (nng_msg_alloc(&acquired_msgs[id], size) != 0) {
+    nng_msg* allocated_msg = nullptr;
+    if (nng_msg_alloc(&allocated_msg, size) != 0) {
       // Restart recv on failure
       nng_ctx_recv(worker->ctx, worker->recv_aio);
       return nullptr;
     }
 
-    scope_msg_t* msg = (scope_msg_t*)nng_msg_body(acquired_msgs[id]);
+    {
+      std::lock_guard<std::mutex> lock(acquired_msgs_mutex);
+      acquired_msgs[id] = allocated_msg;
+    }
+
+    scope_msg_t* msg = (scope_msg_t*)nng_msg_body(allocated_msg);
     msg->id = id;
     return (void*)(msg + 1);
   }
@@ -323,13 +371,20 @@ class ImscopeProducer {
       active_requests.erase(it);
     }
 
-    if (acquired_msgs[id] == nullptr) {
-      nng_ctx_recv(worker->ctx, worker->recv_aio);
-      return IMSCOPE_ERROR_NOT_INITIALIZED;
+    nng_msg* msg_obj = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(acquired_msgs_mutex);
+      auto it = acquired_msgs.find(id);
+      if (it == acquired_msgs.end() || it->second == nullptr) {
+        nng_ctx_recv(worker->ctx, worker->recv_aio);
+        return IMSCOPE_ERROR_NOT_INITIALIZED;
+      }
+      msg_obj = it->second;
+      acquired_msgs.erase(it);
     }
 
     auto start = std::chrono::high_resolution_clock::now();
-    scope_msg_t* msg = (scope_msg_t*)nng_msg_body(acquired_msgs[id]);
+    scope_msg_t* msg = (scope_msg_t*)nng_msg_body(msg_obj);
     msg->id = id;
     msg->meta.frame = frame;
     msg->meta.slot = slot;
@@ -340,8 +395,7 @@ class ImscopeProducer {
             std::chrono::high_resolution_clock::now() - start)
             .count();
 
-    nng_aio_set_msg(worker->send_aio, acquired_msgs[id]);
-    acquired_msgs[id] = nullptr;
+    nng_aio_set_msg(worker->send_aio, msg_obj);
     nng_ctx_send(worker->ctx, worker->send_aio);
     nng_aio_wait(worker->send_aio);
     int rv = nng_aio_result(worker->send_aio);
@@ -368,11 +422,54 @@ extern "C" imscope_return_t imscope_init_producer(const char* data_address,
     instance = new ImscopeProducer();
   }
   instance->clear_scopes();
-  for (size_t i = 0; i < num_scopes; ++i) {
-    instance->add_scope(scopes[i].name, scopes[i].type);
+  if (scopes != nullptr) {
+    for (size_t i = 0; i < num_scopes; ++i) {
+      instance->add_scope(scopes[i].name, scopes[i].type);
+    }
   }
   instance->connect(data_address, announce_address, name);
   return IMSCOPE_SUCCESS;
+}
+
+extern "C" int imscope_register_scope(const char* name, scope_type_t type) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  return instance->get_or_register_scope(name, type);
+}
+
+extern "C" imscope_return_t imscope_try_send_data_by_name(
+    uint32_t* data, const char* name, scope_type_t type, size_t num_samples,
+    int frame, int slot, uint64_t timestamp) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  int id = instance->get_or_register_scope(name, type);
+  return instance->send_scope_data(data, id, num_samples, frame, slot,
+                                   timestamp);
+}
+
+extern "C" void* imscope_acquire_send_buffer_by_name(const char* name,
+                                                     scope_type_t type,
+                                                     size_t num_samples) {
+  if (instance == nullptr) {
+    return nullptr;
+  }
+  int id = instance->get_or_register_scope(name, type);
+  return instance->acquire_buffer(id, num_samples);
+}
+
+extern "C" imscope_return_t imscope_commit_send_buffer_by_name(
+    const char* name, size_t num_samples, int frame, int slot,
+    uint64_t timestamp) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  int id = instance->get_scope_id_by_name(name);
+  if (id < 0) {
+    return IMSCOPE_ERROR_INVALID_ID;
+  }
+  return instance->commit_buffer(id, num_samples, frame, slot, timestamp);
 }
 
 extern "C" imscope_return_t imscope_try_send_data(uint32_t* data, int id,

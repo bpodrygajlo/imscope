@@ -179,3 +179,140 @@ TEST(IntegrationTest, ZeroCopySend) {
   delete consumer;
   imscope_cleanup_producer();
 }
+
+TEST(IntegrationTest, DynamicRegistrationBySend) {
+  const char* data_addr = "inproc://data_dynamic_send";
+  const char* announce_addr = "inproc://announce_dynamic_send";
+
+  // Initialize Producer with NO scopes
+  imscope_return_t rv = imscope_init_producer(
+      data_addr, announce_addr, "DynamicSendProducer", nullptr, 0);
+  ASSERT_EQ(rv, IMSCOPE_SUCCESS);
+
+  // Connect Consumer
+  ImscopeConsumer* consumer = ImscopeConsumer::connect(announce_addr);
+  ASSERT_NE(consumer, nullptr);
+  EXPECT_EQ(consumer->get_num_scopes(), 0);  // No scopes initially
+
+  // Send data to a new scope "dyn_scope" (type REAL).
+  // This should register it on-the-fly.
+  uint32_t data[] = {42, 43, 44};
+  size_t num_samples = 3;
+
+  // Since we haven't requested data, it should return BUSY (it only sends when a request is active)
+  rv = imscope_try_send_data_by_name(data, "dyn_scope", SCOPE_TYPE_REAL,
+                                     num_samples, 10, 5, 100);
+  EXPECT_EQ(rv, IMSCOPE_ERROR_BUSY);
+
+  // Now the consumer refreshes scopes
+  bool refreshed = consumer->refresh_scopes();
+  EXPECT_TRUE(refreshed);
+  EXPECT_EQ(consumer->get_num_scopes(), 1);
+  EXPECT_STREQ(consumer->get_scope_name(0), "dyn_scope");
+
+  // Consumer requests data for scope 0
+  consumer->request_data(0);
+
+  // Wait for the request to be active/received on the producer side
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Now, imscope_try_send_data_by_name should succeed!
+  rv = imscope_try_send_data_by_name(data, "dyn_scope", SCOPE_TYPE_REAL,
+                                     num_samples, 10, 5, 100);
+  ASSERT_EQ(rv, IMSCOPE_SUCCESS);
+
+  // Let's collect the message and verify
+  int handle = 0;
+  NngMsgPtr msg_ptr = nullptr;
+  int retry = 0;
+  while ((msg_ptr = consumer->try_collect_scope_msg(0, handle)) == nullptr &&
+         retry < 100) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    retry++;
+  }
+  ASSERT_NE(msg_ptr, nullptr);
+
+  scope_msg_t* msg = (scope_msg_t*)msg_ptr.get();
+  EXPECT_EQ(msg->meta.frame, 10);
+  EXPECT_EQ(msg->meta.slot, 5);
+  EXPECT_EQ(msg->meta.timestamp, 100);
+  EXPECT_EQ(msg->data_size, num_samples * sizeof(uint32_t));
+
+  uint32_t* recv_data = (uint32_t*)(msg + 1);
+  EXPECT_EQ(recv_data[0], 42);
+  EXPECT_EQ(recv_data[1], 43);
+  EXPECT_EQ(recv_data[2], 44);
+
+  delete consumer;
+  imscope_cleanup_producer();
+}
+
+TEST(IntegrationTest, DynamicRegistrationZeroCopyByName) {
+  const char* data_addr = "inproc://data_dynamic_zc";
+  const char* announce_addr = "inproc://announce_dynamic_zc";
+
+  // Initialize Producer with NO scopes
+  imscope_return_t rv = imscope_init_producer(data_addr, announce_addr,
+                                              "DynamicZCProducer", nullptr, 0);
+  ASSERT_EQ(rv, IMSCOPE_SUCCESS);
+
+  // Connect Consumer
+  ImscopeConsumer* consumer = ImscopeConsumer::connect(announce_addr);
+  ASSERT_NE(consumer, nullptr);
+  EXPECT_EQ(consumer->get_num_scopes(), 0);
+
+  // Attempt to acquire buffer. It will register the scope but return nullptr since no request is active.
+  void* buf =
+      imscope_acquire_send_buffer_by_name("dyn_zc", SCOPE_TYPE_REAL, 10);
+  EXPECT_EQ(buf, nullptr);
+
+  // Consumer refreshes scopes
+  bool refreshed = consumer->refresh_scopes();
+  EXPECT_TRUE(refreshed);
+  EXPECT_EQ(consumer->get_num_scopes(), 1);
+  EXPECT_STREQ(consumer->get_scope_name(0), "dyn_zc");
+
+  // Consumer requests data
+  consumer->request_data(0);
+
+  // Wait for the request to be active/received
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Now, acquiring the buffer by name should succeed!
+  buf = imscope_acquire_send_buffer_by_name("dyn_zc", SCOPE_TYPE_REAL, 10);
+  ASSERT_NE(buf, nullptr);
+
+  uint32_t* iq_buf = (uint32_t*)buf;
+  for (int i = 0; i < 10; ++i) {
+    iq_buf[i] = i * 10;
+  }
+
+  // Commit send buffer by name
+  rv = imscope_commit_send_buffer_by_name("dyn_zc", 10, 20, 10, 200);
+  ASSERT_EQ(rv, IMSCOPE_SUCCESS);
+
+  // Collect message and verify
+  int handle = 0;
+  NngMsgPtr msg_ptr = nullptr;
+  int retry = 0;
+  while ((msg_ptr = consumer->try_collect_scope_msg(0, handle)) == nullptr &&
+         retry < 100) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    retry++;
+  }
+  ASSERT_NE(msg_ptr, nullptr);
+
+  scope_msg_t* msg = (scope_msg_t*)msg_ptr.get();
+  EXPECT_EQ(msg->meta.frame, 20);
+  EXPECT_EQ(msg->meta.slot, 10);
+  EXPECT_EQ(msg->meta.timestamp, 200);
+  EXPECT_EQ(msg->data_size, 10 * sizeof(uint32_t));
+
+  uint32_t* recv_data = (uint32_t*)(msg + 1);
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_EQ(recv_data[i], i * 10);
+  }
+
+  delete consumer;
+  imscope_cleanup_producer();
+}

@@ -60,6 +60,7 @@ ImscopeConsumer::~ImscopeConsumer() {
 }
 
 imscope_return_t ImscopeConsumer::request_data(int scope_id) {
+  std::lock_guard<std::mutex> lock(scopes_mutex);
   if (scope_id >= (int)scope_contexts.size()) {
     return IMSCOPE_ERROR_INVALID_ID;
   }
@@ -86,6 +87,7 @@ imscope_return_t ImscopeConsumer::request_data(int scope_id) {
 }
 
 NngMsgPtr ImscopeConsumer::try_collect_scope_msg(int scope_id, int& version) {
+  std::lock_guard<std::mutex> lock(scopes_mutex);
   if (scope_id >= (int)scope_contexts.size()) {
     return nullptr;
   }
@@ -146,6 +148,7 @@ ImscopeConsumer* ImscopeConsumer::connect(const char* announce_address) {
   auto consumer =
       new ImscopeConsumer(response->data_address, response->num_scopes,
                           response->scopes, response->name);
+  consumer->announce_address = announce_address;
   nng_msg_free(res_msg);
   nng_close(req_sock);
   return consumer;
@@ -194,5 +197,55 @@ bool ImscopeConsumer::try_collect_real(int scope_id,
     real.push_back(data[i]);
   }
 
+  return true;
+}
+
+bool ImscopeConsumer::refresh_scopes() {
+  nng_socket req_sock;
+  int rv = nng_req0_open(&req_sock);
+  if (rv != 0) {
+    return false;
+  }
+  rv = nng_dial(req_sock, announce_address.c_str(), NULL, NNG_FLAG_NONBLOCK);
+  if (rv != 0) {
+    nng_close(req_sock);
+    return false;
+  }
+
+  nng_duration timeout = 200;  // 200 milliseconds, fast enough to avoid UI lag
+  nng_socket_set_ms(req_sock, NNG_OPT_RECVTIMEO, timeout);
+
+  nng_msg* req_msg;
+  rv = nng_msg_alloc(&req_msg, sizeof(announce_request_t));
+  if (rv != 0) {
+    nng_close(req_sock);
+    return false;
+  }
+
+  announce_request_t* announce_msg = (announce_request_t*)nng_msg_body(req_msg);
+  announce_msg->magic = ANNOUNCE_MSG_ID;
+  nng_sendmsg(req_sock, req_msg, 0);
+
+  nng_msg* res_msg;
+  rv = nng_recvmsg(req_sock, &res_msg, 0);
+  if (rv != 0) {
+    nng_close(req_sock);
+    return false;
+  }
+
+  announce_response_t* response = (announce_response_t*)nng_msg_body(res_msg);
+  {
+    std::lock_guard<std::mutex> lock(scopes_mutex);
+    size_t old_size = configured_scopes.size();
+    if (response->num_scopes > (int)old_size) {
+      for (int i = old_size; i < response->num_scopes; i++) {
+        configured_scopes.push_back(response->scopes[i]);
+        scope_contexts.push_back(std::make_unique<ScopeCtx>(this->data_socket));
+      }
+    }
+  }
+
+  nng_msg_free(res_msg);
+  nng_close(req_sock);
   return true;
 }
