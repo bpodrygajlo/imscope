@@ -50,27 +50,30 @@ void IQSnapshot::read_scope_msg(scope_msg_t* msg, bool collect) {
   if (!collect) {
     real.resize(num_samples);
     imag.resize(num_samples);
-    int16_t* data = (int16_t*)msg->data;
-    for (size_t i = 0; i < num_samples; i += 2) {
-      real[i] = data[i];
-      imag[i] = data[i + 1];
+    int16_t* data = (int16_t*)(msg + 1);
+    for (size_t i = 0; i < num_samples; i++) {
+      real[i] = data[2 * i];
+      imag[i] = data[2 * i + 1];
     }
     preprocess();
   } else {
     size_t current_size = real.size();
-    size_t gap = msg->meta.timestamp - current_timestamp;
+    size_t gap = 0;
+    if (current_size > 0 && msg->meta.timestamp > current_timestamp) {
+      gap = msg->meta.timestamp - current_timestamp;
+    }
     size_t new_size = current_size + num_samples + gap;
     real.resize(new_size);
     imag.resize(new_size);
 
-    for (int i = 0; i < gap; i++) {
+    for (size_t i = 0; i < gap; i++) {
       real[current_size + i] = 0;
       imag[current_size + i] = 0;
     }
 
     // Write new samples
-    int16_t* data = (int16_t*)msg->data;
-    for (int i = 0; i < num_samples; i++) {
+    int16_t* data = (int16_t*)(msg + 1);
+    for (size_t i = 0; i < num_samples; i++) {
       real[current_size + gap + i] = data[i * 2];
       imag[current_size + gap + i] = data[i * 2 + 1];
     }
@@ -96,12 +99,12 @@ bool IQSnapshot::read_scope_msg(scope_msg_t* msg, float noise_cutoff_linear,
       "{})",
       scope_id, msg->meta.frame, msg->meta.slot);
   int num_noise_samples = 0;
-  size_t num_samples = msg->data_size / sizeof(uint32_t) / 2;
-  int16_t* data = (int16_t*)msg->data;
+  size_t num_samples = msg->data_size / sizeof(uint32_t);
+  int16_t* data = (int16_t*)(msg + 1);
   for (size_t i = 0; i < num_samples; i++) {
-    float square =
-        data[2 * i] * data[2 * i] + data[2 * i + 1] * data[2 * i + 1];
-    if (square < 2 * noise_cutoff_linear * noise_cutoff_linear) {
+    float square = (float)data[2 * i] * data[2 * i] +
+                   (float)data[2 * i + 1] * data[2 * i + 1];
+    if (square < noise_cutoff_linear * noise_cutoff_linear) {
       num_noise_samples++;
     }
   }
@@ -134,7 +137,7 @@ void VectorSnapshot::preprocess() {
 void VectorSnapshot::read_scope_msg(scope_msg_t* msg) {
   size_t num_samples = msg->data_size / sizeof(int16_t);
   v.resize(num_samples);
-  int16_t* data = (int16_t*)msg->data;
+  int16_t* data = (int16_t*)(msg + 1);
   for (size_t i = 0; i < num_samples; i++) {
     v[i] = data[i];
   }

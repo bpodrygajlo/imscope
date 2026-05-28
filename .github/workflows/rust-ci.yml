@@ -1,0 +1,30 @@
+name: Rust CI
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  rust-build-and-test:
+    if: contains(fromJSON('["MEMBER", "OWNER", "COLLABORATOR"]'), github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Rust Cache
+      uses: swatinem/rust-cache@v2
+
+    - name: Check Formatting
+      run: cargo fmt -- --check
+
+    - name: Cargo Check
+      run: cargo check
+
+    - name: Run Cargo Tests
+      run: cargo test

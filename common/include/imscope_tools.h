@@ -39,7 +39,7 @@ typedef struct {
   int16_t max_iq;
   float max_power;
   int nonzero_count;
-  uint64_t current_timestamp;
+  uint64_t current_timestamp = 0;
   uint64_t max_stacked_size = 30000;
   void preprocess();
 
