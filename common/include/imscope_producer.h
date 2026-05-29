@@ -96,6 +96,44 @@ imscope_return_t imscope_commit_send_buffer(int id, size_t num_samples,
  */
 void imscope_cleanup_producer();
 
+/**
+ * @brief Push a single int32_t value to a scope by ID.
+ *        Collects values and sends them when threshold is met or timeout expires.
+ */
+imscope_return_t imscope_try_send_int32(int32_t val, int id);
+
+/**
+ * @brief Push a single float value to a scope by ID.
+ *        Collects values and sends them when threshold is met or timeout expires.
+ */
+imscope_return_t imscope_try_send_float(float val, int id);
+
+/**
+ * @brief Push a single int32_t value to a scope by name.
+ *        Automatically registers the scope as SCOPE_TYPE_INT32 if it doesn't exist.
+ */
+imscope_return_t imscope_try_send_int32_by_name(int32_t val, const char* name);
+
+/**
+ * @brief Push a single float value to a scope by name.
+ *        Automatically registers the scope as SCOPE_TYPE_FLOAT if it doesn't exist.
+ */
+imscope_return_t imscope_try_send_float_by_name(float val, const char* name);
+
+/**
+ * @brief Push a single int32_t value to a named scope within a group.
+ *        Registers the scope as SCOPE_TYPE_INT32 under the given group if it doesn't exist.
+ */
+imscope_return_t imscope_try_send_int32_by_group(int32_t val, const char* name,
+                                                 const char* group);
+
+/**
+ * @brief Push a single float value to a named scope within a group.
+ *        Registers the scope as SCOPE_TYPE_FLOAT under the given group if it doesn't exist.
+ */
+imscope_return_t imscope_try_send_float_by_group(float val, const char* name,
+                                                 const char* group);
+
 #ifdef __cplusplus
 }
 #endif

@@ -9,6 +9,7 @@
 
 mod consumer;
 
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::mpsc;
 use std::thread;
@@ -32,12 +33,11 @@ use ratatui::{
     },
 };
 
-use crate::consumer::{IQSnapshot, ScopeType, WorkerCommand, WorkerEvent, run_worker};
+use crate::consumer::{IQSnapshot, ScopeConfig, ScopeType, WorkerCommand, WorkerEvent, run_worker};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "TUI client for imscope using Ratatui")]
 struct Args {
-    /// Address of the imscope announcer
     #[arg(short, long, default_value = "tcp://127.0.0.1:5557")]
     announce_url: String,
 }
@@ -85,30 +85,58 @@ enum ConnectionState {
     },
 }
 
+// ── Per-plot-pane state ────────────────────────────────────────────────────────
+
+struct PlotPane {
+    selected_scope_idx: usize,
+    scope_list_state: ListState,
+    active_tab: AppTab,
+    stacking_enabled: bool,
+    stacking_size: usize,
+    filter_enabled: bool,
+    filter_cutoff: f32,
+    filter_percentage: f32,
+    active_snapshot: Option<IQSnapshot>,
+    group_snapshots: HashMap<usize, IQSnapshot>,
+    in_group_mode: bool,
+    ungrouped: bool,
+    /// Scope IDs (and their types) this pane contributes to the worker's fetch list.
+    worker_scopes: Vec<(usize, ScopeType)>,
+}
+
+impl PlotPane {
+    fn new() -> Self {
+        Self {
+            selected_scope_idx: 0,
+            scope_list_state: ListState::default(),
+            active_tab: AppTab::Waveform,
+            stacking_enabled: false,
+            stacking_size: 16000,
+            filter_enabled: false,
+            filter_cutoff: 0.0,
+            filter_percentage: 50.0,
+            active_snapshot: None,
+            group_snapshots: HashMap::new(),
+            in_group_mode: false,
+            ungrouped: false,
+            worker_scopes: Vec::new(),
+        }
+    }
+}
+
+// ── Application state ──────────────────────────────────────────────────────────
+
 struct AppState {
     connection: ConnectionState,
     announce_url: String,
     url_editing: bool,
 
-    selected_scope_idx: usize,
-    scope_list_state: ListState,
+    panes: [PlotPane; 2],
+    num_panes: usize,   // 0, 1, or 2
+    active_pane: usize, // index of the pane that receives keyboard input
 
-    active_tab: AppTab,
-
-    // collection options
     auto_collect_enabled: bool,
-    stacking_enabled: bool,
-    stacking_size: usize,
 
-    // filtering options
-    filter_enabled: bool,
-    filter_cutoff: f32,
-    filter_percentage: f32,
-
-    // active snapshot
-    active_snapshot: Option<IQSnapshot>,
-
-    // statistics
     frame_rate_counter: u32,
     last_frame_rate_calc: Instant,
     current_fps: f32,
@@ -123,16 +151,10 @@ impl AppState {
             connection: ConnectionState::Disconnected(None),
             announce_url,
             url_editing: false,
-            selected_scope_idx: 0,
-            scope_list_state: ListState::default(),
-            active_tab: AppTab::Scatter,
+            panes: [PlotPane::new(), PlotPane::new()],
+            num_panes: 1,
+            active_pane: 0,
             auto_collect_enabled: true,
-            stacking_enabled: false,
-            stacking_size: 16000,
-            filter_enabled: false,
-            filter_cutoff: 0.0,
-            filter_percentage: 50.0,
-            active_snapshot: None,
             frame_rate_counter: 0,
             last_frame_rate_calc: Instant::now(),
             current_fps: 0.0,
@@ -143,29 +165,88 @@ impl AppState {
     }
 }
 
+const GROUP_COLORS: [Color; 8] = [
+    Color::Cyan,
+    Color::Yellow,
+    Color::Green,
+    Color::Magenta,
+    Color::Red,
+    Color::Blue,
+    Color::LightCyan,
+    Color::LightYellow,
+];
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+/// Activate scope `idx` for `pane`: updates worker_scopes, snapshots, and group state.
+fn activate_scope(scopes: &[ScopeConfig], idx: usize, pane: &mut PlotPane) {
+    let group = &scopes[idx].group;
+    if !group.is_empty() && !pane.ungrouped {
+        let members: Vec<(usize, ScopeType)> = scopes
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| &s.group == group)
+            .map(|(i, s)| (i, s.scope_type))
+            .collect();
+        pane.group_snapshots.clear();
+        for &(id, _) in &members {
+            let mut snap = IQSnapshot::new(id as i32);
+            snap.max_stacked_size = pane.stacking_size;
+            pane.group_snapshots.insert(id, snap);
+        }
+        pane.worker_scopes = members;
+        pane.active_snapshot = None;
+        pane.in_group_mode = true;
+    } else {
+        let mut snap = IQSnapshot::new(idx as i32);
+        snap.max_stacked_size = pane.stacking_size;
+        pane.worker_scopes = vec![(idx, scopes[idx].scope_type)];
+        pane.active_snapshot = Some(snap);
+        pane.group_snapshots.clear();
+        pane.in_group_mode = false;
+    }
+    pane.selected_scope_idx = idx;
+    pane.scope_list_state.select(Some(idx));
+}
+
+/// Merge all active panes' worker_scopes (deduped) and tell the worker to collect them.
+fn send_merged_scopes(
+    panes: &[PlotPane; 2],
+    num_panes: usize,
+    cmd_tx: &mpsc::Sender<WorkerCommand>,
+) {
+    let mut all: Vec<(usize, ScopeType)> = Vec::new();
+    let mut seen = HashSet::new();
+    for pane in &panes[..num_panes] {
+        for &(id, stype) in &pane.worker_scopes {
+            if seen.insert(id) {
+                all.push((id, stype));
+            }
+        }
+    }
+    let _ = cmd_tx.send(WorkerCommand::SelectGroup { members: all });
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────────
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // Set up terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Create communication channels
     let (cmd_tx, cmd_rx) = mpsc::channel();
     let (event_tx, event_rx) = mpsc::channel();
 
-    // Spawn worker thread
     thread::spawn(move || {
         run_worker(cmd_rx, event_tx);
     });
 
-    // Initialize App State
     let mut app_state = AppState::new(args.announce_url.clone());
 
-    // Trigger initial connection attempt
     app_state.status_message = format!("Connecting to {}...", args.announce_url);
     app_state.status_msg_time = Some(Instant::now());
     let _ = cmd_tx.send(WorkerCommand::Connect {
@@ -173,7 +254,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let mut last_tick = Instant::now();
-    let tick_rate = Duration::from_millis(33); // ~30 FPS
+    let tick_rate = Duration::from_millis(33);
 
     loop {
         // 1. Process network events from worker
@@ -197,19 +278,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app_state.status_message = "Connected successfully!".to_string();
                     app_state.status_msg_time = Some(Instant::now());
 
-                    // Select first scope by default
                     if !scopes.is_empty() {
-                        app_state.selected_scope_idx = 0;
-                        app_state.scope_list_state.select(Some(0));
-                        let scope = &scopes[0];
-                        let _ = cmd_tx.send(WorkerCommand::SelectScope {
-                            scope_id: 0,
-                            scope_type: scope.scope_type,
-                        });
-
-                        let mut snapshot = IQSnapshot::new(0);
-                        snapshot.max_stacked_size = app_state.stacking_size;
-                        app_state.active_snapshot = Some(snapshot);
+                        for pane_idx in 0..app_state.num_panes {
+                            let scope_idx = if pane_idx == 0 {
+                                0
+                            } else {
+                                (app_state.panes[0].selected_scope_idx + 1) % scopes.len()
+                            };
+                            activate_scope(&scopes, scope_idx, &mut app_state.panes[pane_idx]);
+                        }
+                        send_merged_scopes(&app_state.panes, app_state.num_panes, &cmd_tx);
                     }
                 }
                 WorkerEvent::ConnectionFailed(err) => {
@@ -218,11 +296,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app_state.status_msg_time = Some(Instant::now());
                 }
                 WorkerEvent::NewData { scope_id, msg } => {
-                    if let Some(ref mut snapshot) = app_state.active_snapshot {
-                        if snapshot.scope_id == scope_id as i32 {
-                            snapshot.read_scope_msg(msg, app_state.stacking_enabled);
-                            app_state.frame_rate_counter += 1;
+                    let mut routed = false;
+                    'route: for pane in &mut app_state.panes[..app_state.num_panes] {
+                        for &(id, _) in &pane.worker_scopes {
+                            if id == scope_id {
+                                if pane.in_group_mode {
+                                    if let Some(snap) = pane.group_snapshots.get_mut(&scope_id) {
+                                        snap.read_scope_msg(msg, pane.stacking_enabled);
+                                        routed = true;
+                                    }
+                                } else if let Some(ref mut snapshot) = pane.active_snapshot {
+                                    if snapshot.scope_id == scope_id as i32 {
+                                        snapshot.read_scope_msg(msg, pane.stacking_enabled);
+                                        routed = true;
+                                    }
+                                }
+                                break 'route;
+                            }
                         }
+                    }
+                    if routed {
+                        app_state.frame_rate_counter += 1;
                     }
                 }
                 WorkerEvent::Error(err) => {
@@ -238,23 +332,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         *ref_mut_scopes = scopes.clone();
                         app_state.status_message = "Scopes refreshed successfully!".to_string();
 
-                        // Keep selected_scope_idx within bounds
                         if !scopes.is_empty() {
-                            if app_state.selected_scope_idx >= scopes.len() {
-                                app_state.selected_scope_idx = 0;
+                            for pane_idx in 0..app_state.num_panes {
+                                let idx = app_state.panes[pane_idx]
+                                    .selected_scope_idx
+                                    .min(scopes.len() - 1);
+                                activate_scope(&scopes, idx, &mut app_state.panes[pane_idx]);
                             }
-                            app_state
-                                .scope_list_state
-                                .select(Some(app_state.selected_scope_idx));
-
-                            let scope = &scopes[app_state.selected_scope_idx];
-                            let _ = cmd_tx.send(WorkerCommand::SelectScope {
-                                scope_id: app_state.selected_scope_idx,
-                                scope_type: scope.scope_type,
-                            });
+                            send_merged_scopes(&app_state.panes, app_state.num_panes, &cmd_tx);
                         } else {
-                            app_state.scope_list_state.select(None);
-                            app_state.active_snapshot = None;
+                            for pane in &mut app_state.panes {
+                                pane.scope_list_state.select(None);
+                                pane.active_snapshot = None;
+                                pane.group_snapshots.clear();
+                                pane.in_group_mode = false;
+                                pane.worker_scopes.clear();
+                            }
+                            send_merged_scopes(&app_state.panes, app_state.num_panes, &cmd_tx);
                         }
                     } else {
                         app_state.status_message =
@@ -305,7 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 _ => {}
                             }
                         } else {
-                            // General shortcut keys
+                            let ap = app_state.active_pane;
                             match key.code {
                                 KeyCode::Char('q') => break,
                                 KeyCode::Char('c') => {
@@ -319,41 +413,93 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 KeyCode::Char('e') | KeyCode::Char('i') => {
                                     app_state.url_editing = true;
                                 }
+                                // ── Pane management ──────────────────────────
+                                KeyCode::Char('p') => {
+                                    if app_state.num_panes == 2 {
+                                        app_state.active_pane = 1 - app_state.active_pane;
+                                    }
+                                }
+                                KeyCode::Char('P') => {
+                                    // Cycle: 1 → 2 → 0 → 1
+                                    app_state.num_panes = (app_state.num_panes + 1) % 3;
+                                    match app_state.num_panes {
+                                        0 => {
+                                            send_merged_scopes(&app_state.panes, 0, &cmd_tx);
+                                            app_state.active_pane = 0;
+                                        }
+                                        1 => {
+                                            send_merged_scopes(&app_state.panes, 1, &cmd_tx);
+                                            app_state.active_pane = 0;
+                                        }
+                                        2 => {
+                                            if let ConnectionState::Connected {
+                                                ref scopes, ..
+                                            } = app_state.connection
+                                            {
+                                                if !scopes.is_empty()
+                                                    && app_state.panes[1].worker_scopes.is_empty()
+                                                {
+                                                    let next =
+                                                        (app_state.panes[0].selected_scope_idx + 1)
+                                                            % scopes.len();
+                                                    activate_scope(
+                                                        scopes,
+                                                        next,
+                                                        &mut app_state.panes[1],
+                                                    );
+                                                }
+                                            }
+                                            app_state.active_pane = 1;
+                                            send_merged_scopes(
+                                                &app_state.panes,
+                                                app_state.num_panes,
+                                                &cmd_tx,
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                // ── Tab navigation (active pane) ─────────────
                                 KeyCode::Tab => {
-                                    app_state.active_tab = app_state.active_tab.next();
+                                    app_state.panes[ap].active_tab =
+                                        app_state.panes[ap].active_tab.next();
                                 }
                                 KeyCode::BackTab => {
-                                    app_state.active_tab = app_state.active_tab.prev();
+                                    app_state.panes[ap].active_tab =
+                                        app_state.panes[ap].active_tab.prev();
                                 }
-                                KeyCode::Char('1') => app_state.active_tab = AppTab::Scatter,
-                                KeyCode::Char('2') => app_state.active_tab = AppTab::Rms,
-                                KeyCode::Char('3') => app_state.active_tab = AppTab::Waveform,
-                                KeyCode::Char('4') => app_state.active_tab = AppTab::Histogram,
-
+                                KeyCode::Char('1') => {
+                                    app_state.panes[ap].active_tab = AppTab::Scatter;
+                                }
+                                KeyCode::Char('2') => {
+                                    app_state.panes[ap].active_tab = AppTab::Rms;
+                                }
+                                KeyCode::Char('3') => {
+                                    app_state.panes[ap].active_tab = AppTab::Waveform;
+                                }
+                                KeyCode::Char('4') => {
+                                    app_state.panes[ap].active_tab = AppTab::Histogram;
+                                }
+                                // ── Scope navigation (active pane) ───────────
                                 KeyCode::Up | KeyCode::Char('k') => {
                                     if let ConnectionState::Connected { ref scopes, .. } =
                                         app_state.connection
                                     {
                                         if !scopes.is_empty() {
-                                            app_state.selected_scope_idx = app_state
+                                            let new_idx = app_state.panes[ap]
                                                 .selected_scope_idx
                                                 .checked_sub(1)
                                                 .unwrap_or(scopes.len() - 1);
-                                            app_state
-                                                .scope_list_state
-                                                .select(Some(app_state.selected_scope_idx));
-
-                                            let scope = &scopes[app_state.selected_scope_idx];
-                                            let _ = cmd_tx.send(WorkerCommand::SelectScope {
-                                                scope_id: app_state.selected_scope_idx,
-                                                scope_type: scope.scope_type,
-                                            });
-
-                                            let mut snapshot = IQSnapshot::new(
-                                                app_state.selected_scope_idx as i32,
+                                            activate_scope(
+                                                scopes,
+                                                new_idx,
+                                                &mut app_state.panes[ap],
                                             );
-                                            snapshot.max_stacked_size = app_state.stacking_size;
-                                            app_state.active_snapshot = Some(snapshot);
+                                            send_merged_scopes(
+                                                &app_state.panes,
+                                                app_state.num_panes,
+                                                &cmd_tx,
+                                            );
                                         }
                                     }
                                 }
@@ -362,26 +508,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         app_state.connection
                                     {
                                         if !scopes.is_empty() {
-                                            app_state.selected_scope_idx =
-                                                (app_state.selected_scope_idx + 1) % scopes.len();
-                                            app_state
-                                                .scope_list_state
-                                                .select(Some(app_state.selected_scope_idx));
-
-                                            let scope = &scopes[app_state.selected_scope_idx];
-                                            let _ = cmd_tx.send(WorkerCommand::SelectScope {
-                                                scope_id: app_state.selected_scope_idx,
-                                                scope_type: scope.scope_type,
-                                            });
-
-                                            let mut snapshot = IQSnapshot::new(
-                                                app_state.selected_scope_idx as i32,
+                                            let new_idx = (app_state.panes[ap].selected_scope_idx
+                                                + 1)
+                                                % scopes.len();
+                                            activate_scope(
+                                                scopes,
+                                                new_idx,
+                                                &mut app_state.panes[ap],
                                             );
-                                            snapshot.max_stacked_size = app_state.stacking_size;
-                                            app_state.active_snapshot = Some(snapshot);
+                                            send_merged_scopes(
+                                                &app_state.panes,
+                                                app_state.num_panes,
+                                                &cmd_tx,
+                                            );
                                         }
                                     }
                                 }
+                                // ── Collect / stacking (active pane) ─────────
                                 KeyCode::Char('a') => {
                                     app_state.auto_collect_enabled =
                                         !app_state.auto_collect_enabled;
@@ -390,7 +533,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     ));
                                 }
                                 KeyCode::Char('s') => {
-                                    app_state.stacking_enabled = !app_state.stacking_enabled;
+                                    app_state.panes[ap].stacking_enabled =
+                                        !app_state.panes[ap].stacking_enabled;
+                                }
+                                KeyCode::Char('g') => {
+                                    app_state.panes[ap].ungrouped = !app_state.panes[ap].ungrouped;
+                                    if let ConnectionState::Connected { ref scopes, .. } =
+                                        app_state.connection
+                                    {
+                                        if !scopes.is_empty() {
+                                            let idx = app_state.panes[ap].selected_scope_idx;
+                                            activate_scope(scopes, idx, &mut app_state.panes[ap]);
+                                            send_merged_scopes(
+                                                &app_state.panes,
+                                                app_state.num_panes,
+                                                &cmd_tx,
+                                            );
+                                        }
+                                    }
                                 }
                                 KeyCode::Char('r') => {
                                     let _ = cmd_tx.send(WorkerCommand::RequestSingleFrame);
@@ -400,62 +560,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app_state.status_msg_time = Some(Instant::now());
                                     let _ = cmd_tx.send(WorkerCommand::RefreshScopes);
                                 }
+                                // ── Filter (active pane) ──────────────────────
                                 KeyCode::Char('f') => {
-                                    app_state.filter_enabled = !app_state.filter_enabled;
+                                    app_state.panes[ap].filter_enabled =
+                                        !app_state.panes[ap].filter_enabled;
                                     let _ = cmd_tx.send(WorkerCommand::SetFilter {
-                                        enabled: app_state.filter_enabled,
-                                        cutoff: app_state.filter_cutoff,
-                                        percentage: app_state.filter_percentage,
+                                        enabled: app_state.panes[ap].filter_enabled,
+                                        cutoff: app_state.panes[ap].filter_cutoff,
+                                        percentage: app_state.panes[ap].filter_percentage,
                                     });
                                 }
                                 KeyCode::Char('+') | KeyCode::Char('=') => {
-                                    app_state.stacking_size =
-                                        (app_state.stacking_size + 1000).min(100000);
-                                    if let Some(ref mut snapshot) = app_state.active_snapshot {
-                                        snapshot.max_stacked_size = app_state.stacking_size;
+                                    app_state.panes[ap].stacking_size =
+                                        (app_state.panes[ap].stacking_size + 1000).min(100000);
+                                    let sz = app_state.panes[ap].stacking_size;
+                                    if let Some(ref mut s) = app_state.panes[ap].active_snapshot {
+                                        s.max_stacked_size = sz;
+                                    }
+                                    for s in app_state.panes[ap].group_snapshots.values_mut() {
+                                        s.max_stacked_size = sz;
                                     }
                                 }
                                 KeyCode::Char('-') | KeyCode::Char('_') => {
-                                    app_state.stacking_size =
-                                        (app_state.stacking_size.saturating_sub(1000)).max(1000);
-                                    if let Some(ref mut snapshot) = app_state.active_snapshot {
-                                        snapshot.max_stacked_size = app_state.stacking_size;
+                                    app_state.panes[ap].stacking_size =
+                                        (app_state.panes[ap].stacking_size.saturating_sub(1000))
+                                            .max(1000);
+                                    let sz = app_state.panes[ap].stacking_size;
+                                    if let Some(ref mut s) = app_state.panes[ap].active_snapshot {
+                                        s.max_stacked_size = sz;
+                                    }
+                                    for s in app_state.panes[ap].group_snapshots.values_mut() {
+                                        s.max_stacked_size = sz;
                                     }
                                 }
                                 KeyCode::Char(']') => {
-                                    app_state.filter_cutoff =
-                                        (app_state.filter_cutoff + 10.0).min(32767.0);
+                                    app_state.panes[ap].filter_cutoff =
+                                        (app_state.panes[ap].filter_cutoff + 10.0).min(32767.0);
                                     let _ = cmd_tx.send(WorkerCommand::SetFilter {
-                                        enabled: app_state.filter_enabled,
-                                        cutoff: app_state.filter_cutoff,
-                                        percentage: app_state.filter_percentage,
+                                        enabled: app_state.panes[ap].filter_enabled,
+                                        cutoff: app_state.panes[ap].filter_cutoff,
+                                        percentage: app_state.panes[ap].filter_percentage,
                                     });
                                 }
                                 KeyCode::Char('[') => {
-                                    app_state.filter_cutoff =
-                                        (app_state.filter_cutoff - 10.0).max(0.0);
+                                    app_state.panes[ap].filter_cutoff =
+                                        (app_state.panes[ap].filter_cutoff - 10.0).max(0.0);
                                     let _ = cmd_tx.send(WorkerCommand::SetFilter {
-                                        enabled: app_state.filter_enabled,
-                                        cutoff: app_state.filter_cutoff,
-                                        percentage: app_state.filter_percentage,
+                                        enabled: app_state.panes[ap].filter_enabled,
+                                        cutoff: app_state.panes[ap].filter_cutoff,
+                                        percentage: app_state.panes[ap].filter_percentage,
                                     });
                                 }
                                 KeyCode::Char('}') => {
-                                    app_state.filter_percentage =
-                                        (app_state.filter_percentage + 5.0).min(100.0);
+                                    app_state.panes[ap].filter_percentage =
+                                        (app_state.panes[ap].filter_percentage + 5.0).min(100.0);
                                     let _ = cmd_tx.send(WorkerCommand::SetFilter {
-                                        enabled: app_state.filter_enabled,
-                                        cutoff: app_state.filter_cutoff,
-                                        percentage: app_state.filter_percentage,
+                                        enabled: app_state.panes[ap].filter_enabled,
+                                        cutoff: app_state.panes[ap].filter_cutoff,
+                                        percentage: app_state.panes[ap].filter_percentage,
                                     });
                                 }
                                 KeyCode::Char('{') => {
-                                    app_state.filter_percentage =
-                                        (app_state.filter_percentage - 5.0).max(0.0);
+                                    app_state.panes[ap].filter_percentage =
+                                        (app_state.panes[ap].filter_percentage - 5.0).max(0.0);
                                     let _ = cmd_tx.send(WorkerCommand::SetFilter {
-                                        enabled: app_state.filter_enabled,
-                                        cutoff: app_state.filter_cutoff,
-                                        percentage: app_state.filter_percentage,
+                                        enabled: app_state.panes[ap].filter_enabled,
+                                        cutoff: app_state.panes[ap].filter_cutoff,
+                                        percentage: app_state.panes[ap].filter_percentage,
                                     });
                                 }
                                 _ => {}
@@ -487,7 +658,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Restore terminal
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -499,51 +669,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// ── Draw ───────────────────────────────────────────────────────────────────────
+
 fn draw_ui(frame: &mut Frame, state: &mut AppState) {
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(10),   // Content
-            Constraint::Length(3), // Status bar
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
         ])
         .split(frame.area());
 
-    // Render Header
+    // Header
     let fps_text = format!("FPS: {:.1}", state.current_fps);
+    let pane_info = match state.num_panes {
+        0 => " | Plots: 0".to_string(),
+        1 => " | Plots: 1".to_string(),
+        _ => format!(" | Plots: 2  Active: P{}", state.active_pane + 1),
+    };
     let title_block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let title_paragraph = Paragraph::new(Line::from(vec![
         Span::raw(" 🛠️  ").fg(Color::Cyan),
         Span::styled(
-            "IMScope TUI - Real-time IQ Signal Analyzer",
+            "IMScope TUI - Real-time Signal Analyzer",
             Style::default()
                 .add_modifier(Modifier::BOLD)
                 .fg(Color::White),
         ),
         Span::raw(" | ").fg(Color::DarkGray),
         Span::styled(fps_text, Style::default().fg(Color::Green)),
+        Span::styled(pane_info, Style::default().fg(Color::Cyan)),
     ]))
     .block(title_block)
     .alignment(Alignment::Left);
-
     frame.render_widget(title_paragraph, main_chunks[0]);
 
-    // Split Content into Left Sidebar and Right Plot Area
+    // Content: sidebar + plot area(s)
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(42), // Sidebar width
-            Constraint::Min(20),    // Plot area
-        ])
+        .constraints([Constraint::Length(42), Constraint::Min(20)])
         .split(main_chunks[1]);
 
     draw_sidebar(frame, content_chunks[0], state);
-    draw_plot_area(frame, content_chunks[1], state);
 
-    // Render Status Bar
-    let shortcut_text = "q: Quit | i: Edit URL | c: Connect | R: Refresh | a: Auto Collect | r: Request Single | f: Toggle Filter";
+    match state.num_panes {
+        0 => {
+            let msg = Paragraph::new("\n\nNo plots active.\nPress 'P' to add a plot.")
+                .alignment(Alignment::Center)
+                .fg(Color::DarkGray)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                );
+            frame.render_widget(msg, content_chunks[1]);
+        }
+        1 => {
+            draw_plot_area(frame, content_chunks[1], state, 0);
+        }
+        _ => {
+            let plot_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(content_chunks[1]);
+            draw_plot_area(frame, plot_chunks[0], state, 0);
+            draw_plot_area(frame, plot_chunks[1], state, 1);
+        }
+    }
+
+    // Status bar
+    let shortcut_text = "q:Quit i:URL c:Connect R:Refresh a:Auto r:Single s:Stack g:Ungroup f:Filter P:Panes p:Switch";
     let status_paragraph = Paragraph::new(Line::from(vec![
         Span::styled(
             " [KEYS] ",
@@ -564,7 +762,6 @@ fn draw_ui(frame: &mut Frame, state: &mut AppState) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray)),
     );
-
     frame.render_widget(status_paragraph, main_chunks[2]);
 }
 
@@ -572,13 +769,13 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6), // Connection Block
-            Constraint::Length(9), // Scopes List
-            Constraint::Min(10),   // Control Settings
+            Constraint::Length(6),
+            Constraint::Length(9),
+            Constraint::Min(10),
         ])
         .split(area);
 
-    // 1. Connection Block
+    // ── 1. Connection block ────────────────────────────────────────────────────
     let status_span = match &state.connection {
         ConnectionState::Disconnected(err_opt) => {
             if let Some(err) = err_opt {
@@ -613,6 +810,12 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Style::default().fg(Color::Cyan)
     };
 
+    let pane_label = match state.num_panes {
+        0 => "No plots  (P: add)".to_string(),
+        1 => "1 plot  (P: add, p: -)".to_string(),
+        _ => format!("2 plots  Active: P{}  (p: switch)", state.active_pane + 1),
+    };
+
     let conn_lines = vec![
         Line::from(vec![Span::raw("Status: "), status_span]),
         Line::from(vec![
@@ -627,16 +830,10 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
             })
             .fg(Color::DarkGray),
         ]),
-        Line::from(vec![
-            Span::raw("Press "),
-            Span::styled(
-                "R",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" to refresh scopes").fg(Color::DarkGray),
-        ]),
+        Line::from(vec![Span::styled(
+            pane_label,
+            Style::default().fg(Color::Cyan),
+        )]),
     ];
 
     let conn_block = Block::default()
@@ -649,25 +846,73 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         }));
     frame.render_widget(Paragraph::new(conn_lines).block(conn_block), chunks[0]);
 
-    // 2. Scopes List Block
+    // ── 2. Scopes list ─────────────────────────────────────────────────────────
+    let ap = state.active_pane;
     let mut list_items = Vec::new();
     let mut active_scope_name = "None".to_string();
     let mut active_scope_type = ScopeType::IqData;
 
     if let ConnectionState::Connected { ref scopes, .. } = state.connection {
+        let active_group = scopes
+            .get(state.panes[ap].selected_scope_idx)
+            .map(|s| s.group.as_str())
+            .unwrap_or("");
+
+        // Inactive pane's selection (when 2 panes shown)
+        let inactive_sel = if state.num_panes == 2 {
+            Some(state.panes[1 - ap].selected_scope_idx)
+        } else {
+            None
+        };
+        let inactive_group = inactive_sel
+            .and_then(|idx| scopes.get(idx))
+            .map(|s| s.group.as_str())
+            .unwrap_or("");
+
         for (i, scope) in scopes.iter().enumerate() {
             let type_str = match scope.scope_type {
                 ScopeType::Real => "Real",
                 ScopeType::IqData => "IQ",
+                ScopeType::Int32 => "Int32",
+                ScopeType::Float => "Float",
+            };
+            let item_text = if !scope.group.is_empty() {
+                format!("{:02}. [{}] {} [{}]", i, scope.group, scope.name, type_str)
+            } else {
+                format!("{:02}. {} [{}]", i, scope.name, type_str)
             };
 
-            let item_text = format!("{:02}. {} [{}]", i, scope.name, type_str);
-            let style = if i == state.selected_scope_idx {
+            let is_active_sel = i == state.panes[ap].selected_scope_idx;
+            let is_inactive_sel = inactive_sel == Some(i);
+            let is_active_grp = !scope.group.is_empty()
+                && !active_group.is_empty()
+                && scope.group == active_group
+                && !is_active_sel;
+            let is_inactive_grp = !scope.group.is_empty()
+                && !inactive_group.is_empty()
+                && scope.group == inactive_group
+                && !is_inactive_sel
+                && !is_active_sel;
+
+            let style = if is_active_sel {
                 active_scope_name = scope.name.clone();
                 active_scope_type = scope.scope_type;
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_inactive_sel {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Blue)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_active_grp {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_inactive_grp {
+                Style::default()
+                    .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
@@ -682,11 +927,12 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         .borders(Borders::ALL)
         .title(" Available Scopes (▲/▼) ")
         .border_style(Style::default().fg(Color::DarkGray));
-
     let list = List::new(list_items).block(list_block);
-    frame.render_stateful_widget(list, chunks[1], &mut state.scope_list_state);
+    frame.render_stateful_widget(list, chunks[1], &mut state.panes[ap].scope_list_state);
 
-    // 3. Settings Block
+    // ── 3. Settings (active pane) ──────────────────────────────────────────────
+    let pane = &state.panes[ap];
+
     let auto_status = if state.auto_collect_enabled {
         Span::styled(
             " [x] ON  (Running)",
@@ -698,7 +944,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Span::styled(" [ ] OFF (Idle)", Style::default().fg(Color::Red))
     };
 
-    let stacking_status = if state.stacking_enabled {
+    let stacking_status = if pane.stacking_enabled {
         Span::styled(
             " [x] ENABLED",
             Style::default()
@@ -709,7 +955,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Span::styled(" [ ] DISABLED", Style::default().fg(Color::DarkGray))
     };
 
-    let filter_status = if state.filter_enabled {
+    let filter_status = if pane.filter_enabled {
         Span::styled(
             " [x] ENABLED",
             Style::default()
@@ -738,13 +984,29 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from(vec![
             Span::raw("Stacking size: "),
             Span::styled(
-                format!("{:>5}", state.stacking_size),
+                format!("{:>5}", pane.stacking_size),
                 Style::default().fg(Color::Cyan),
             ),
             Span::raw("  "),
             Span::styled(" [-] ", Style::default().fg(Color::White).bg(Color::Red)),
             Span::raw(" "),
             Span::styled(" [+] ", Style::default().fg(Color::White).bg(Color::Green)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Ungroup ('g'):     ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            if pane.ungrouped {
+                Span::styled(
+                    " [x] INDIVIDUAL",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(" [ ] GROUPED", Style::default().fg(Color::DarkGray))
+            },
         ]),
         Line::from(Span::raw("")),
         Line::from(vec![
@@ -757,7 +1019,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from(vec![
             Span::raw("Cutoff linear: "),
             Span::styled(
-                format!("{:>5.0}", state.filter_cutoff),
+                format!("{:>5.0}", pane.filter_cutoff),
                 Style::default().fg(Color::Cyan),
             ),
             Span::raw("  "),
@@ -768,7 +1030,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Line::from(vec![
             Span::raw("Max noise %:   "),
             Span::styled(
-                format!("{:>4.0}%", state.filter_percentage),
+                format!("{:>4.0}%", pane.filter_percentage),
                 Style::default().fg(Color::Cyan),
             ),
             Span::raw("  "),
@@ -796,7 +1058,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ]),
     ];
 
-    if let Some(ref snapshot) = state.active_snapshot {
+    if let Some(ref snapshot) = pane.active_snapshot {
         settings_lines.push(Line::from(vec![
             Span::raw("BufferSize: "),
             Span::styled(
@@ -804,11 +1066,20 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
                 Style::default().fg(Color::Green),
             ),
         ]));
+    } else if pane.in_group_mode && !pane.group_snapshots.is_empty() {
+        let total: usize = pane.group_snapshots.values().map(|s| s.size()).sum();
+        settings_lines.push(Line::from(vec![
+            Span::raw("BufferSize: "),
+            Span::styled(
+                format!("{} (group)", total),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]));
     }
 
     let settings_block = Block::default()
         .borders(Borders::ALL)
-        .title(" Controls & Settings ")
+        .title(format!(" Controls & Settings (P{}) ", ap + 1))
         .border_style(Style::default().fg(Color::DarkGray));
 
     frame.render_widget(
@@ -817,58 +1088,213 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
     );
 }
 
-fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState) {
+fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx: usize) {
+    let is_active = pane_idx == state.active_pane;
+    let border_color = if is_active { Color::Cyan } else { Color::Blue };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Tab bar
-            Constraint::Min(10),   // Plot canvas
-            Constraint::Length(5), // Metadata block
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(5),
         ])
         .split(area);
 
-    // 1. Render Tabs
+    // Determine scope type for the current pane's selection
+    let active_scope_type_for_meta =
+        if let ConnectionState::Connected { ref scopes, .. } = state.connection {
+            scopes
+                .get(state.panes[pane_idx].selected_scope_idx)
+                .map(|s| s.scope_type)
+        } else {
+            None
+        };
+
+    // ── Tab bar ────────────────────────────────────────────────────────────────
     let tab_titles = vec![
-        "1. Scatter (IQ)",
-        "2. RMS Power (IQ)",
+        "1. Scatter (IQ only)",
+        "2. RMS Power (IQ only)",
         "3. Waveform",
         "4. Histogram",
     ];
     let tab_style = Style::default().fg(Color::White);
     let selected_style = Style::default()
         .fg(Color::Black)
-        .bg(Color::Cyan)
+        .bg(border_color)
         .add_modifier(Modifier::BOLD);
 
     let tabs = Tabs::new(tab_titles)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Plot Select (Tab) "),
+                .title(format!(" Plot P{} (Tab) ", pane_idx + 1))
+                .border_style(Style::default().fg(border_color)),
         )
-        .select(state.active_tab.as_index())
+        .select(state.panes[pane_idx].active_tab.as_index())
         .style(tab_style)
         .highlight_style(selected_style);
-
     frame.render_widget(tabs, chunks[0]);
 
-    // 2. Render selected Plot
+    // ── Plot block ─────────────────────────────────────────────────────────────
     let plot_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(border_color));
 
-    if let Some(ref snapshot) = state.active_snapshot {
-        if snapshot.size() == 0 {
-            let no_data_msg = Paragraph::new("\n\nNo scope data received yet.\nEnable 'Auto Collect' or press 'r' to trigger request.")
+    let pane = &state.panes[pane_idx];
+
+    if pane.in_group_mode {
+        // ── Group mode ──────────────────────────────────────────────────────────
+        let mut members: Vec<(String, Vec<f64>, f64, f64)> = Vec::new();
+        if let ConnectionState::Connected { ref scopes, .. } = state.connection {
+            let mut ids: Vec<usize> = pane.group_snapshots.keys().copied().collect();
+            ids.sort();
+            for id in ids {
+                if let Some(snap) = pane.group_snapshots.get(&id) {
+                    if snap.size() > 0 {
+                        members.push((
+                            scopes[id].name.clone(),
+                            snap.real.clone(),
+                            snap.min_val,
+                            snap.max_val,
+                        ));
+                    }
+                }
+            }
+        }
+
+        match pane.active_tab {
+            AppTab::Scatter | AppTab::Rms => {
+                let msg = Paragraph::new(
+                    "\n\nScatter and RMS Power plots are not available for grouped scopes.",
+                )
                 .alignment(Alignment::Center)
-                .fg(Color::DarkGray)
+                .fg(Color::Yellow)
                 .block(plot_block);
-            frame.render_widget(no_data_msg, chunks[1]);
+                frame.render_widget(msg, chunks[1]);
+            }
+            AppTab::Waveform | AppTab::Histogram => {
+                if members.is_empty() {
+                    let msg = Paragraph::new(
+                        "\n\nNo group data received yet.\nEnable 'Auto Collect' or press 'r'.",
+                    )
+                    .alignment(Alignment::Center)
+                    .fg(Color::DarkGray)
+                    .block(plot_block);
+                    frame.render_widget(msg, chunks[1]);
+                } else if pane.active_tab == AppTab::Waveform {
+                    let global_min = members
+                        .iter()
+                        .map(|(_, _, lo, _)| *lo)
+                        .fold(f64::MAX, f64::min);
+                    let global_max = members
+                        .iter()
+                        .map(|(_, _, _, hi)| *hi)
+                        .fold(f64::MIN, f64::max);
+                    let max_samples = members
+                        .iter()
+                        .map(|(_, d, _, _)| d.len())
+                        .max()
+                        .unwrap_or(1);
+                    let margin = ((global_max - global_min) * 0.1).max(1.0);
+                    let y_lo = global_min - margin;
+                    let y_hi = global_max + margin;
+
+                    let canvas = Canvas::default()
+                        .block(plot_block.title(" Group Values (Time Series) "))
+                        .x_bounds([0.0, max_samples as f64])
+                        .y_bounds([y_lo, y_hi])
+                        .paint(move |ctx| {
+                            let baseline = 0.0_f64.clamp(y_lo, y_hi);
+                            ctx.draw(&ratatui::widgets::canvas::Line {
+                                x1: 0.0,
+                                y1: baseline,
+                                x2: max_samples as f64,
+                                y2: baseline,
+                                color: Color::DarkGray,
+                            });
+                            for (i, (name, data, _, _)) in members.iter().enumerate() {
+                                let color = GROUP_COLORS[i % GROUP_COLORS.len()];
+                                let n = data.len();
+                                let step = (n / 500).max(1);
+                                for j in (0..n.saturating_sub(step)).step_by(step) {
+                                    ctx.draw(&ratatui::widgets::canvas::Line {
+                                        x1: j as f64,
+                                        y1: data[j],
+                                        x2: (j + step) as f64,
+                                        y2: data[j + step],
+                                        color,
+                                    });
+                                }
+                                let legend_y =
+                                    y_hi - (i as f64 + 1.0) * ((y_hi - y_lo) * 0.08).max(0.5);
+                                ctx.print(
+                                    max_samples as f64 * 0.01,
+                                    legend_y,
+                                    format!("■ {}", name).fg(color),
+                                );
+                            }
+                        });
+                    frame.render_widget(canvas, chunks[1]);
+                } else {
+                    // Histogram per group member
+                    let num_bins = 16usize;
+                    let member_count = members.len();
+                    let bar_width = ((chunks[1].width as usize).saturating_sub(2))
+                        / (member_count * (num_bins + 1)).max(1);
+                    let bar_width = bar_width.max(1) as u16;
+
+                    let mut all_bars: Vec<Bar> = Vec::new();
+                    for (m_idx, (name, data, min_v, max_v)) in members.iter().enumerate() {
+                        let color = GROUP_COLORS[m_idx % GROUP_COLORS.len()];
+                        let lo = *min_v as f32;
+                        let hi = (*max_v as f32).max(lo + 1.0);
+                        let bin_w = (hi - lo) / num_bins as f32;
+                        let mut counts = vec![0u64; num_bins];
+                        for &v in data {
+                            let idx = (((v as f32 - lo) / bin_w) as usize).min(num_bins - 1);
+                            counts[idx] += 1;
+                        }
+                        if m_idx > 0 {
+                            all_bars.push(Bar::default().value(0).label(""));
+                        }
+                        for (b, &cnt) in counts.iter().enumerate() {
+                            let center = lo + (b as f32 + 0.5) * bin_w;
+                            all_bars.push(
+                                Bar::default()
+                                    .value(cnt)
+                                    .label(if b == 0 { name.as_str() } else { "" })
+                                    .style(Style::default().fg(color))
+                                    .value_style(Style::default().fg(Color::White))
+                                    .text_value(format!("{:.0}", center)),
+                            );
+                        }
+                    }
+                    let group_data = BarGroup::default().bars(&all_bars);
+                    let chart = BarChart::default()
+                        .block(plot_block.title(" Group Histogram "))
+                        .data(group_data)
+                        .bar_width(bar_width)
+                        .bar_gap(0)
+                        .label_style(Style::default().fg(Color::Gray));
+                    frame.render_widget(chart, chunks[1]);
+                }
+            }
+        }
+    } else if let Some(ref snapshot) = pane.active_snapshot {
+        if snapshot.size() == 0 {
+            let msg = Paragraph::new(
+                "\n\nNo scope data received yet.\nEnable 'Auto Collect' or press 'r'.",
+            )
+            .alignment(Alignment::Center)
+            .fg(Color::DarkGray)
+            .block(plot_block);
+            frame.render_widget(msg, chunks[1]);
         } else {
-            match state.active_tab {
+            match pane.active_tab {
                 AppTab::Scatter => {
                     if let ConnectionState::Connected { ref scopes, .. } = state.connection {
-                        if scopes[state.selected_scope_idx].scope_type == ScopeType::Real {
+                        if scopes[pane.selected_scope_idx].scope_type != ScopeType::IqData {
                             let msg = Paragraph::new(
                                 "\n\nScatter/Constellation plot is only available for IQ scopes.",
                             )
@@ -876,58 +1302,55 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState) {
                             .fg(Color::Yellow)
                             .block(plot_block);
                             frame.render_widget(msg, chunks[1]);
-                            return;
+                            // still render metadata below
+                        } else {
+                            let limit = (snapshot.max_iq as f64 * 1.2).max(1.0);
+                            let skip = (snapshot.real.len() / 2000).max(1);
+                            let points = snapshot
+                                .real
+                                .iter()
+                                .zip(snapshot.imag.iter())
+                                .step_by(skip)
+                                .map(|(&r, &im)| (r as f64, im as f64))
+                                .collect::<Vec<(f64, f64)>>();
+                            let canvas = Canvas::default()
+                                .block(
+                                    plot_block.title(" Constellation Scatterplot (Imag vs Real) "),
+                                )
+                                .x_bounds([-limit, limit])
+                                .y_bounds([-limit, limit])
+                                .paint(move |ctx| {
+                                    ctx.draw(&ratatui::widgets::canvas::Line {
+                                        x1: -limit,
+                                        y1: 0.0,
+                                        x2: limit,
+                                        y2: 0.0,
+                                        color: Color::DarkGray,
+                                    });
+                                    ctx.draw(&ratatui::widgets::canvas::Line {
+                                        x1: 0.0,
+                                        y1: -limit,
+                                        x2: 0.0,
+                                        y2: limit,
+                                        color: Color::DarkGray,
+                                    });
+                                    ctx.draw(&Points {
+                                        coords: &points,
+                                        color: Color::Cyan,
+                                    });
+                                    ctx.print(
+                                        -limit * 0.95,
+                                        limit * 0.85,
+                                        format!("Max IQ: {:.0}", limit).fg(Color::Gray),
+                                    );
+                                });
+                            frame.render_widget(canvas, chunks[1]);
                         }
                     }
-
-                    let limit = (snapshot.max_iq as f64 * 1.2).max(1.0);
-                    let skip = (snapshot.real.len() / 2000).max(1);
-                    let points = snapshot
-                        .real
-                        .iter()
-                        .zip(snapshot.imag.iter())
-                        .step_by(skip)
-                        .map(|(&r, &im)| (r as f64, im as f64))
-                        .collect::<Vec<(f64, f64)>>();
-
-                    let canvas = Canvas::default()
-                        .block(plot_block.title(" Constellation Scatterplot (Imag vs Real) "))
-                        .x_bounds([-limit, limit])
-                        .y_bounds([-limit, limit])
-                        .paint(move |ctx| {
-                            // Draw Grid/Axes
-                            ctx.draw(&ratatui::widgets::canvas::Line {
-                                x1: -limit,
-                                y1: 0.0,
-                                x2: limit,
-                                y2: 0.0,
-                                color: Color::DarkGray,
-                            });
-                            ctx.draw(&ratatui::widgets::canvas::Line {
-                                x1: 0.0,
-                                y1: -limit,
-                                x2: 0.0,
-                                y2: limit,
-                                color: Color::DarkGray,
-                            });
-                            // Draw Points
-                            ctx.draw(&Points {
-                                coords: &points,
-                                color: Color::Cyan,
-                            });
-
-                            // Labels
-                            ctx.print(
-                                -limit * 0.95,
-                                limit * 0.85,
-                                format!("Max IQ: {:.0}", limit).fg(Color::Gray),
-                            );
-                        });
-                    frame.render_widget(canvas, chunks[1]);
                 }
                 AppTab::Rms => {
                     if let ConnectionState::Connected { ref scopes, .. } = state.connection {
-                        if scopes[state.selected_scope_idx].scope_type == ScopeType::Real {
+                        if scopes[pane.selected_scope_idx].scope_type != ScopeType::IqData {
                             let msg = Paragraph::new(
                                 "\n\nRMS Power plot is only available for IQ scopes.",
                             )
@@ -935,118 +1358,125 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState) {
                             .fg(Color::Yellow)
                             .block(plot_block);
                             frame.render_widget(msg, chunks[1]);
-                            return;
+                        } else {
+                            let max_p = (snapshot.max_power as f64 * 1.1).max(1.0);
+                            let num_samples = snapshot.power.len();
+                            let canvas = Canvas::default()
+                                .block(plot_block.title(" RMS Power over Samples (r^2 + im^2) "))
+                                .x_bounds([0.0, num_samples as f64])
+                                .y_bounds([0.0, max_p])
+                                .paint(move |ctx| {
+                                    ctx.draw(&ratatui::widgets::canvas::Line {
+                                        x1: 0.0,
+                                        y1: max_p * 0.5,
+                                        x2: num_samples as f64,
+                                        y2: max_p * 0.5,
+                                        color: Color::Indexed(236),
+                                    });
+                                    let step = (num_samples / 500).max(1);
+                                    for i in (0..num_samples.saturating_sub(step)).step_by(step) {
+                                        ctx.draw(&ratatui::widgets::canvas::Line {
+                                            x1: i as f64,
+                                            y1: snapshot.power[i] as f64,
+                                            x2: (i + step) as f64,
+                                            y2: snapshot.power[i + step] as f64,
+                                            color: Color::Yellow,
+                                        });
+                                    }
+                                    ctx.print(
+                                        0.0,
+                                        max_p * 0.9,
+                                        format!("Max Power: {:.0}", max_p).fg(Color::Gray),
+                                    );
+                                });
+                            frame.render_widget(canvas, chunks[1]);
                         }
                     }
-
-                    let max_p = (snapshot.max_power as f64 * 1.1).max(1.0);
-                    let num_samples = snapshot.power.len();
-
-                    let canvas = Canvas::default()
-                        .block(plot_block.title(" RMS Power over Samples (r^2 + im^2) "))
-                        .x_bounds([0.0, num_samples as f64])
-                        .y_bounds([0.0, max_p])
-                        .paint(move |ctx| {
-                            // Draw grid lines
-                            ctx.draw(&ratatui::widgets::canvas::Line {
-                                x1: 0.0,
-                                y1: max_p * 0.5,
-                                x2: num_samples as f64,
-                                y2: max_p * 0.5,
-                                color: Color::Indexed(236),
-                            });
-
-                            // Plot power line
-                            let step = (num_samples / 500).max(1);
-                            for i in (0..num_samples.saturating_sub(step)).step_by(step) {
-                                ctx.draw(&ratatui::widgets::canvas::Line {
-                                    x1: i as f64,
-                                    y1: snapshot.power[i] as f64,
-                                    x2: (i + step) as f64,
-                                    y2: snapshot.power[i + step] as f64,
-                                    color: Color::Yellow,
-                                });
-                            }
-
-                            // Labels
-                            ctx.print(
-                                0.0,
-                                max_p * 0.9,
-                                format!("Max Power: {:.0}", max_p).fg(Color::Gray),
-                            );
-                        });
-                    frame.render_widget(canvas, chunks[1]);
                 }
                 AppTab::Waveform => {
-                    let limit = (snapshot.max_iq as f64 * 1.1).max(1.0);
+                    let is_scalar = matches!(
+                        active_scope_type_for_meta,
+                        Some(ScopeType::Int32) | Some(ScopeType::Float)
+                    );
                     let num_samples = snapshot.real.len();
-
+                    let (y_lo, y_hi, title) = if is_scalar {
+                        let margin = ((snapshot.max_val - snapshot.min_val) * 0.1).max(1.0);
+                        (
+                            snapshot.min_val - margin,
+                            snapshot.max_val + margin,
+                            " Values (Time Series) ",
+                        )
+                    } else {
+                        let limit = (snapshot.max_iq * 1.1).max(1.0);
+                        (-limit, limit, " Real Amplitudes Waveform ")
+                    };
                     let canvas = Canvas::default()
-                        .block(plot_block.title(" Real Amplitudes Waveform "))
+                        .block(plot_block.title(title))
                         .x_bounds([0.0, num_samples as f64])
-                        .y_bounds([-limit, limit])
+                        .y_bounds([y_lo, y_hi])
                         .paint(move |ctx| {
-                            // Center line
+                            let baseline = 0.0_f64.clamp(y_lo, y_hi);
                             ctx.draw(&ratatui::widgets::canvas::Line {
                                 x1: 0.0,
-                                y1: 0.0,
+                                y1: baseline,
                                 x2: num_samples as f64,
-                                y2: 0.0,
+                                y2: baseline,
                                 color: Color::DarkGray,
                             });
-
-                            // Plot waveform
                             let step = (num_samples / 500).max(1);
                             for i in (0..num_samples.saturating_sub(step)).step_by(step) {
                                 ctx.draw(&ratatui::widgets::canvas::Line {
                                     x1: i as f64,
-                                    y1: snapshot.real[i] as f64,
+                                    y1: snapshot.real[i],
                                     x2: (i + step) as f64,
-                                    y2: snapshot.real[i + step] as f64,
+                                    y2: snapshot.real[i + step],
                                     color: Color::Green,
                                 });
                             }
-
-                            // Labels
                             ctx.print(
                                 0.0,
-                                limit * 0.8,
-                                format!("Limit: ±{:.0}", limit).fg(Color::Gray),
+                                y_hi * 0.9,
+                                format!("Range: [{:.1}, {:.1}]", y_lo, y_hi).fg(Color::Gray),
                             );
                         });
                     frame.render_widget(canvas, chunks[1]);
                 }
                 AppTab::Histogram => {
+                    let is_scalar = matches!(
+                        active_scope_type_for_meta,
+                        Some(ScopeType::Int32) | Some(ScopeType::Float)
+                    );
                     let num_bins = 20;
                     let mut bin_counts = vec![0u64; num_bins];
-                    let limit = snapshot.max_iq.max(1) as f32;
-                    let bin_width = (2.0 * limit) / (num_bins as f32);
-
+                    let (range_lo, range_hi) = if is_scalar {
+                        let lo = snapshot.min_val as f32;
+                        let hi = (snapshot.max_val as f32).max(lo + 1.0);
+                        (lo, hi)
+                    } else {
+                        let limit = snapshot.max_iq.max(1.0) as f32;
+                        (-limit, limit)
+                    };
+                    let bin_width = (range_hi - range_lo) / (num_bins as f32);
                     for &val in &snapshot.real {
-                        let float_val = val as f32;
-                        let idx = (((float_val + limit) / bin_width) as usize).min(num_bins - 1);
+                        let idx =
+                            (((val as f32 - range_lo) / bin_width) as usize).min(num_bins - 1);
                         bin_counts[idx] += 1;
                     }
-
                     let bars: Vec<Bar> = (0..num_bins)
                         .map(|i| {
-                            let bin_center = -limit + (i as f32 + 0.5) * bin_width;
-                            let label = format!("{:.0}", bin_center);
+                            let center = range_lo + (i as f32 + 0.5) * bin_width;
                             Bar::default()
-                                .label(label)
+                                .label(format!("{:.0}", center))
                                 .value(bin_counts[i])
                                 .style(Style::default().fg(Color::Magenta))
                         })
                         .collect();
-
-                    let chart_group = BarGroup::default().bars(&bars);
-
                     let chart = BarChart::default()
                         .block(
                             plot_block
                                 .title(" Amplitude Density Distribution (1D Real Histogram) "),
                         )
-                        .data(chart_group)
+                        .data(BarGroup::default().bars(&bars))
                         .bar_width(3)
                         .bar_gap(1)
                         .value_style(
@@ -1055,27 +1485,42 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState) {
                                 .add_modifier(Modifier::BOLD),
                         )
                         .label_style(Style::default().fg(Color::Gray));
-
                     frame.render_widget(chart, chunks[1]);
                 }
             }
         }
     } else {
-        let no_conn_msg = Paragraph::new("\n\nNot connected to any producer.\nPlease enter announcer address on the left and connect.")
-            .alignment(Alignment::Center)
-            .fg(Color::DarkGray)
-            .block(plot_block);
-        frame.render_widget(no_conn_msg, chunks[1]);
+        let msg = Paragraph::new(
+            "\n\nNot connected to any producer.\nPlease enter announcer address on the left and connect.",
+        )
+        .alignment(Alignment::Center)
+        .fg(Color::DarkGray)
+        .block(plot_block);
+        frame.render_widget(msg, chunks[1]);
     }
 
-    // 3. Render Metadata footer
+    // ── Metadata footer ────────────────────────────────────────────────────────
     let meta_block = Block::default()
         .borders(Borders::ALL)
         .title(" Active Frame Metadata ")
         .border_style(Style::default().fg(Color::DarkGray));
 
-    if let Some(ref snapshot) = state.active_snapshot {
-        let meta_lines = vec![
+    let pane = &state.panes[pane_idx];
+    if let Some(ref snapshot) = pane.active_snapshot {
+        let is_scalar = matches!(
+            active_scope_type_for_meta,
+            Some(ScopeType::Int32) | Some(ScopeType::Float)
+        );
+        let first_line = if is_scalar {
+            Line::from(vec![
+                Span::raw("Slot: "),
+                Span::styled("N/A", Style::default().fg(Color::DarkGray)),
+                Span::raw("   Frame: "),
+                Span::styled("N/A", Style::default().fg(Color::DarkGray)),
+                Span::raw("   Timestamp: "),
+                Span::styled("N/A", Style::default().fg(Color::DarkGray)),
+            ])
+        } else {
             Line::from(vec![
                 Span::raw("Slot: "),
                 Span::styled(
@@ -1098,25 +1543,74 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState) {
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD),
                 ),
-            ]),
+            ])
+        };
+        let max_label = if is_scalar {
+            "Max absolute value: "
+        } else {
+            "Max absolute IQ value: "
+        };
+        let meta_lines = vec![
+            first_line,
             Line::from(vec![
-                Span::raw("Max absolute IQ value: "),
+                Span::raw(max_label),
                 Span::styled(
                     format!("{}", snapshot.max_iq),
                     Style::default().fg(Color::Green),
                 ),
-                Span::raw("   Non-zero samples count: "),
+                Span::raw("   Non-zero samples: "),
                 Span::styled(
                     format!("{}", snapshot.nonzero_count),
                     Style::default().fg(Color::Green),
                 ),
-                Span::raw("   Total stacked samples: "),
+                Span::raw("   Total stacked: "),
                 Span::styled(
                     format!("{}", snapshot.size()),
                     Style::default().fg(Color::Green),
                 ),
             ]),
         ];
+        frame.render_widget(Paragraph::new(meta_lines).block(meta_block), chunks[2]);
+    } else if pane.in_group_mode {
+        let group_name = if let ConnectionState::Connected { ref scopes, .. } = state.connection {
+            scopes
+                .get(pane.selected_scope_idx)
+                .map(|s| s.group.clone())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let mut meta_lines = vec![Line::from(vec![
+            Span::raw("Group: "),
+            Span::styled(
+                group_name,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   Slot/Frame/Timestamp: "),
+            Span::styled("N/A", Style::default().fg(Color::DarkGray)),
+        ])];
+
+        if let ConnectionState::Connected { ref scopes, .. } = state.connection {
+            let mut ids: Vec<usize> = pane.group_snapshots.keys().copied().collect();
+            ids.sort();
+            let mut parts: Vec<Span> = vec![Span::raw("Members: ")];
+            for (k, &id) in ids.iter().enumerate() {
+                if let (Some(snap), Some(scope)) = (pane.group_snapshots.get(&id), scopes.get(id)) {
+                    if k > 0 {
+                        parts.push(Span::raw("   "));
+                    }
+                    let color = GROUP_COLORS[k % GROUP_COLORS.len()];
+                    parts.push(Span::styled(
+                        format!("■ {}: {} samples", scope.name, snap.size()),
+                        Style::default().fg(color),
+                    ));
+                }
+            }
+            meta_lines.push(Line::from(parts));
+        }
         frame.render_widget(Paragraph::new(meta_lines).block(meta_block), chunks[2]);
     } else {
         frame.render_widget(
@@ -1128,6 +1622,8 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState) {
     }
 }
 
+// ── Mouse click handler ────────────────────────────────────────────────────────
+
 fn handle_mouse_click(
     col: u16,
     row: u16,
@@ -1138,39 +1634,38 @@ fn handle_mouse_click(
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Min(10),   // Content
-            Constraint::Length(3), // Status bar
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
         ])
         .split(area);
 
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(42), // Sidebar width
-            Constraint::Min(20),    // Plot area
-        ])
+        .constraints([Constraint::Length(42), Constraint::Min(20)])
         .split(main_chunks[1]);
 
     let sidebar_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(6), // Connection Block
-            Constraint::Length(9), // Scopes List
-            Constraint::Min(10),   // Control Settings
+            Constraint::Length(6),
+            Constraint::Length(9),
+            Constraint::Min(10),
         ])
         .split(content_chunks[0]);
 
     let plot_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Tab bar
-            Constraint::Min(10),   // Plot canvas
-            Constraint::Length(5), // Metadata block
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(5),
         ])
         .split(content_chunks[1]);
 
-    // 1. Check if clicked inside Connection Block
+    let ap = state.active_pane;
+
+    // 1. Connection block
     let conn = sidebar_chunks[0];
     if col >= conn.x && col < conn.x + conn.width && row >= conn.y && row < conn.y + conn.height {
         if row == conn.y + 2 {
@@ -1189,7 +1684,7 @@ fn handle_mouse_click(
         return;
     }
 
-    // 2. Check if clicked inside Scopes List
+    // 2. Scopes list
     let scopes_rect = sidebar_chunks[1];
     if col >= scopes_rect.x
         && col < scopes_rect.x + scopes_rect.width
@@ -1202,25 +1697,15 @@ fn handle_mouse_click(
             if row >= list_start_y && row < list_end_y {
                 let clicked_idx = (row - list_start_y) as usize;
                 if clicked_idx < scopes.len() {
-                    state.selected_scope_idx = clicked_idx;
-                    state.scope_list_state.select(Some(clicked_idx));
-
-                    let scope = &scopes[clicked_idx];
-                    let _ = cmd_tx.send(WorkerCommand::SelectScope {
-                        scope_id: clicked_idx,
-                        scope_type: scope.scope_type,
-                    });
-
-                    let mut snapshot = IQSnapshot::new(clicked_idx as i32);
-                    snapshot.max_stacked_size = state.stacking_size;
-                    state.active_snapshot = Some(snapshot);
+                    activate_scope(scopes, clicked_idx, &mut state.panes[ap]);
+                    send_merged_scopes(&state.panes, state.num_panes, cmd_tx);
                 }
             }
         }
         return;
     }
 
-    // 3. Check if clicked inside Controls Settings
+    // 3. Controls settings
     let controls = sidebar_chunks[2];
     if col >= controls.x
         && col < controls.x + controls.width
@@ -1234,63 +1719,70 @@ fn handle_mouse_click(
                 let _ = cmd_tx.send(WorkerCommand::SetAutoCollect(state.auto_collect_enabled));
             }
             1 => {
-                state.stacking_enabled = !state.stacking_enabled;
+                state.panes[ap].stacking_enabled = !state.panes[ap].stacking_enabled;
             }
             2 => {
                 let relative_col = col as i32 - controls.x as i32 - 1;
                 if relative_col >= 22 && relative_col <= 26 {
-                    state.stacking_size = (state.stacking_size.saturating_sub(1000)).max(1000);
-                    if let Some(ref mut snapshot) = state.active_snapshot {
-                        snapshot.max_stacked_size = state.stacking_size;
+                    state.panes[ap].stacking_size =
+                        (state.panes[ap].stacking_size.saturating_sub(1000)).max(1000);
+                    let sz = state.panes[ap].stacking_size;
+                    if let Some(ref mut s) = state.panes[ap].active_snapshot {
+                        s.max_stacked_size = sz;
                     }
                 } else if relative_col >= 28 && relative_col <= 32 {
-                    state.stacking_size = (state.stacking_size + 1000).min(100000);
-                    if let Some(ref mut snapshot) = state.active_snapshot {
-                        snapshot.max_stacked_size = state.stacking_size;
+                    state.panes[ap].stacking_size =
+                        (state.panes[ap].stacking_size + 1000).min(100000);
+                    let sz = state.panes[ap].stacking_size;
+                    if let Some(ref mut s) = state.panes[ap].active_snapshot {
+                        s.max_stacked_size = sz;
                     }
                 }
             }
             4 => {
-                state.filter_enabled = !state.filter_enabled;
+                state.panes[ap].filter_enabled = !state.panes[ap].filter_enabled;
                 let _ = cmd_tx.send(WorkerCommand::SetFilter {
-                    enabled: state.filter_enabled,
-                    cutoff: state.filter_cutoff,
-                    percentage: state.filter_percentage,
+                    enabled: state.panes[ap].filter_enabled,
+                    cutoff: state.panes[ap].filter_cutoff,
+                    percentage: state.panes[ap].filter_percentage,
                 });
             }
             5 => {
                 let relative_col = col as i32 - controls.x as i32 - 1;
                 if relative_col >= 22 && relative_col <= 26 {
-                    state.filter_cutoff = (state.filter_cutoff - 10.0).max(0.0);
+                    state.panes[ap].filter_cutoff = (state.panes[ap].filter_cutoff - 10.0).max(0.0);
                     let _ = cmd_tx.send(WorkerCommand::SetFilter {
-                        enabled: state.filter_enabled,
-                        cutoff: state.filter_cutoff,
-                        percentage: state.filter_percentage,
+                        enabled: state.panes[ap].filter_enabled,
+                        cutoff: state.panes[ap].filter_cutoff,
+                        percentage: state.panes[ap].filter_percentage,
                     });
                 } else if relative_col >= 28 && relative_col <= 32 {
-                    state.filter_cutoff = (state.filter_cutoff + 10.0).min(32767.0);
+                    state.panes[ap].filter_cutoff =
+                        (state.panes[ap].filter_cutoff + 10.0).min(32767.0);
                     let _ = cmd_tx.send(WorkerCommand::SetFilter {
-                        enabled: state.filter_enabled,
-                        cutoff: state.filter_cutoff,
-                        percentage: state.filter_percentage,
+                        enabled: state.panes[ap].filter_enabled,
+                        cutoff: state.panes[ap].filter_cutoff,
+                        percentage: state.panes[ap].filter_percentage,
                     });
                 }
             }
             6 => {
                 let relative_col = col as i32 - controls.x as i32 - 1;
                 if relative_col >= 22 && relative_col <= 26 {
-                    state.filter_percentage = (state.filter_percentage - 5.0).max(0.0);
+                    state.panes[ap].filter_percentage =
+                        (state.panes[ap].filter_percentage - 5.0).max(0.0);
                     let _ = cmd_tx.send(WorkerCommand::SetFilter {
-                        enabled: state.filter_enabled,
-                        cutoff: state.filter_cutoff,
-                        percentage: state.filter_percentage,
+                        enabled: state.panes[ap].filter_enabled,
+                        cutoff: state.panes[ap].filter_cutoff,
+                        percentage: state.panes[ap].filter_percentage,
                     });
                 } else if relative_col >= 28 && relative_col <= 32 {
-                    state.filter_percentage = (state.filter_percentage + 5.0).min(100.0);
+                    state.panes[ap].filter_percentage =
+                        (state.panes[ap].filter_percentage + 5.0).min(100.0);
                     let _ = cmd_tx.send(WorkerCommand::SetFilter {
-                        enabled: state.filter_enabled,
-                        cutoff: state.filter_cutoff,
-                        percentage: state.filter_percentage,
+                        enabled: state.panes[ap].filter_enabled,
+                        cutoff: state.panes[ap].filter_cutoff,
+                        percentage: state.panes[ap].filter_percentage,
                     });
                 }
             }
@@ -1299,7 +1791,7 @@ fn handle_mouse_click(
         return;
     }
 
-    // 4. Check if clicked inside Tab bar
+    // 4. Tab bar (first plot pane when split, or single pane)
     let tab_bar = plot_chunks[0];
     if col >= tab_bar.x
         && col < tab_bar.x + tab_bar.width
@@ -1308,7 +1800,7 @@ fn handle_mouse_click(
     {
         let relative_col = col as i32 - tab_bar.x as i32 - 1;
         if relative_col >= 0 {
-            state.active_tab = if relative_col < 17 {
+            state.panes[ap].active_tab = if relative_col < 17 {
                 AppTab::Scatter
             } else if relative_col < 37 {
                 AppTab::Rms
@@ -1321,6 +1813,8 @@ fn handle_mouse_click(
     }
 }
 
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1331,21 +1825,10 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let area = Rect::new(0, 0, 120, 24);
 
-        // Plot tab bar is located in plot_chunks[0]
-        // main_chunks: height constraints [3, Min(10), 3]
-        // content_chunks: horizontal constraints [42, Min(20)]
-        // Plot area is content_chunks[1] (x=42, width=78)
-        // plot_chunks: vertical constraints [3, Min(10), 5] inside content_chunks[1]
-        // So tab_bar has x=42, y=3, width=78, height=3.
-
-        // Clicking tab 2 (Waveform)
-        // tab_bar is at x=42, y=3.
-        // Waveform starts at relative_col = 38.
-        // col = 42 + 1 + 38 = 81.
-        // row = 3 + 1 = 4.
+        // tab_bar: x=42, y=3, width=78, height=3
+        // Waveform starts at relative_col=38, so col=42+1+38=81, row=3+1=4
         handle_mouse_click(81, 4, area, &mut state, &tx);
-
-        assert_eq!(state.active_tab, AppTab::Waveform);
+        assert_eq!(state.panes[0].active_tab, AppTab::Waveform);
     }
 
     #[test]
@@ -1356,7 +1839,6 @@ mod tests {
 
         handle_mouse_click(5, 7, area, &mut state, &tx);
 
-        // Check that command was sent
         let cmd = rx.try_recv().unwrap();
         match cmd {
             WorkerCommand::RefreshScopes => {}

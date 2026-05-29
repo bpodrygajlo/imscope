@@ -18,6 +18,7 @@
 
 #define MAX_OFFSETS 14
 #define MAX_SCOPE_NAME_LEN 64
+#define MAX_GROUP_NAME_LEN 64
 #define ANNOUNCE_MSG_ID 0xABCDEF01
 
 typedef struct {
@@ -37,6 +38,8 @@ typedef enum {
 typedef enum {
   SCOPE_TYPE_REAL = 0,
   SCOPE_TYPE_IQ_DATA = 1,
+  SCOPE_TYPE_INT32 = 2,
+  SCOPE_TYPE_FLOAT = 3,
 } scope_type_t;
 
 typedef struct {
@@ -54,6 +57,7 @@ typedef struct {
 
 typedef struct {
   char name[MAX_SCOPE_NAME_LEN];
+  char group[MAX_GROUP_NAME_LEN];
   scope_type_t type;
 } imscope_scope_config_t;
 

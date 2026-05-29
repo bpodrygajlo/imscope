@@ -249,3 +249,45 @@ bool ImscopeConsumer::refresh_scopes() {
   nng_close(req_sock);
   return true;
 }
+
+bool ImscopeConsumer::try_collect_int32(int scope_id,
+                                        std::vector<int32_t>& values) {
+  int version = 0;
+  auto msg_ptr = try_collect_scope_msg(scope_id, version);
+  if (!msg_ptr) {
+    return false;
+  }
+
+  scope_msg_t* msg = static_cast<scope_msg_t*>(msg_ptr.get());
+  size_t num_samples = msg->data_size / 4;
+  int32_t* data = reinterpret_cast<int32_t*>(msg + 1);
+
+  values.clear();
+  values.reserve(num_samples);
+  for (size_t i = 0; i < num_samples; ++i) {
+    values.push_back(data[i]);
+  }
+
+  return true;
+}
+
+bool ImscopeConsumer::try_collect_float(int scope_id,
+                                        std::vector<float>& values) {
+  int version = 0;
+  auto msg_ptr = try_collect_scope_msg(scope_id, version);
+  if (!msg_ptr) {
+    return false;
+  }
+
+  scope_msg_t* msg = static_cast<scope_msg_t*>(msg_ptr.get());
+  size_t num_samples = msg->data_size / 4;
+  float* data = reinterpret_cast<float*>(msg + 1);
+
+  values.clear();
+  values.reserve(num_samples);
+  for (size_t i = 0; i < num_samples; ++i) {
+    values.push_back(data[i]);
+  }
+
+  return true;
+}

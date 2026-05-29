@@ -27,6 +27,7 @@
 
 typedef struct {
   std::string name;
+  std::string group;
   scope_type_t type;
 } scope_info_t;
 
@@ -138,6 +139,9 @@ class ImscopeProducer {
               strncpy(msg->scopes[i].name,
                       self->parent->configured_scopes[i].name.c_str(),
                       MAX_SCOPE_NAME_LEN - 1);
+              strncpy(msg->scopes[i].group,
+                      self->parent->configured_scopes[i].group.c_str(),
+                      MAX_GROUP_NAME_LEN - 1);
               msg->scopes[i].type = self->parent->configured_scopes[i].type;
             }
 
@@ -168,10 +172,168 @@ class ImscopeProducer {
   std::mutex scopes_mutex;
   std::mutex acquired_msgs_mutex;
 
+  std::mutex scalar_mutex;
+  std::thread flush_thread;
+  std::atomic<bool> flush_thread_running{false};
+
+  struct ScalarAccumulator {
+    std::vector<uint32_t> buffer;
+    std::chrono::steady_clock::time_point last_send_time;
+
+    ScalarAccumulator() { last_send_time = std::chrono::steady_clock::now(); }
+  };
+
+  std::map<int, ScalarAccumulator> scalar_accumulators;
+
+ public:
+  imscope_return_t push_scalar_value(uint32_t val, int id) {
+    std::lock_guard<std::mutex> lock(scalar_mutex);
+    auto& acc = scalar_accumulators[id];
+    acc.buffer.push_back(val);
+
+    if (acc.buffer.size() > 10000) {
+      acc.buffer.erase(acc.buffer.begin(),
+                       acc.buffer.begin() + (acc.buffer.size() - 10000));
+    }
+
+    bool threshold_reached = acc.buffer.size() >= 256;
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now - acc.last_send_time)
+                          .count();
+    bool timeout_reached = elapsed_ms >= 30 && !acc.buffer.empty();
+
+    if (threshold_reached || timeout_reached) {
+      ScopeCtx* worker = nullptr;
+      {
+        std::lock_guard<std::mutex> active_lock(active_requests_mutex);
+        auto it = active_requests.find(id);
+        if (it != active_requests.end()) {
+          worker = it->second;
+          active_requests.erase(it);
+        }
+      }
+      if (worker) {
+        worker->req_received.store(false);
+        nng_msg* req_msg = nng_aio_get_msg(worker->recv_aio);
+        if (req_msg) {
+          nng_msg_free(req_msg);
+        }
+
+        auto start = std::chrono::high_resolution_clock::now();
+        size_t size =
+            sizeof(scope_msg_t) + sizeof(uint32_t) * acc.buffer.size();
+        nng_msg* msg_obj;
+        nng_msg_alloc(&msg_obj, size);
+        scope_msg_t* msg = (scope_msg_t*)nng_msg_body(msg_obj);
+        msg->meta = {};
+        msg->id = id;
+        msg->data_size = acc.buffer.size() * sizeof(uint32_t);
+        memcpy((void*)(msg + 1), acc.buffer.data(),
+               sizeof(uint32_t) * acc.buffer.size());
+        msg->time_taken_in_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::high_resolution_clock::now() - start)
+                .count();
+
+        nng_aio_set_msg(worker->send_aio, msg_obj);
+        nng_ctx_send(worker->ctx, worker->send_aio);
+        nng_aio_wait(worker->send_aio);
+        int rv = nng_aio_result(worker->send_aio);
+
+        nng_ctx_recv(worker->ctx, worker->recv_aio);
+
+        acc.buffer.clear();
+        acc.last_send_time = now;
+
+        if (rv != 0) {
+          return IMSCOPE_ERROR_INTERNAL;
+        }
+        return IMSCOPE_SUCCESS;
+      }
+    }
+    return IMSCOPE_SUCCESS;
+  }
+
+  void flush_all_accumulators() {
+    std::lock_guard<std::mutex> lock(scalar_mutex);
+    auto now = std::chrono::steady_clock::now();
+    for (auto& pair : scalar_accumulators) {
+      int id = pair.first;
+      auto& acc = pair.second;
+      if (acc.buffer.empty()) {
+        continue;
+      }
+      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - acc.last_send_time)
+                            .count();
+      if (elapsed_ms >= 30) {
+        ScopeCtx* worker = nullptr;
+        {
+          std::lock_guard<std::mutex> active_lock(active_requests_mutex);
+          auto it = active_requests.find(id);
+          if (it != active_requests.end()) {
+            worker = it->second;
+            active_requests.erase(it);
+          }
+        }
+        if (worker) {
+          worker->req_received.store(false);
+          nng_msg* req_msg = nng_aio_get_msg(worker->recv_aio);
+          if (req_msg) {
+            nng_msg_free(req_msg);
+          }
+
+          auto start = std::chrono::high_resolution_clock::now();
+          size_t size =
+              sizeof(scope_msg_t) + sizeof(uint32_t) * acc.buffer.size();
+          nng_msg* msg_obj;
+          nng_msg_alloc(&msg_obj, size);
+          scope_msg_t* msg = (scope_msg_t*)nng_msg_body(msg_obj);
+          msg->meta = {};
+          msg->id = id;
+          msg->data_size = acc.buffer.size() * sizeof(uint32_t);
+          memcpy((void*)(msg + 1), acc.buffer.data(),
+                 sizeof(uint32_t) * acc.buffer.size());
+          msg->time_taken_in_ns =
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::high_resolution_clock::now() - start)
+                  .count();
+
+          nng_aio_set_msg(worker->send_aio, msg_obj);
+          nng_ctx_send(worker->ctx, worker->send_aio);
+          nng_aio_wait(worker->send_aio);
+          nng_ctx_recv(worker->ctx, worker->recv_aio);
+
+          acc.buffer.clear();
+          acc.last_send_time = now;
+        }
+      }
+    }
+  }
+
+  void start_flush_thread() {
+    flush_thread_running = true;
+    flush_thread = std::thread([this]() {
+      while (flush_thread_running) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        flush_all_accumulators();
+      }
+    });
+  }
+
+  void stop_flush_thread() {
+    flush_thread_running = false;
+    if (flush_thread.joinable()) {
+      flush_thread.join();
+    }
+  }
+
  public:
   ImscopeProducer() {}
 
   ~ImscopeProducer() {
+    stop_flush_thread();
     announce_handler.reset();
     if (nng_socket_id(announce_socket) > 0) {
       nng_close(announce_socket);
@@ -189,10 +351,16 @@ class ImscopeProducer {
   void clear_scopes() {
     std::lock_guard<std::mutex> lock(scopes_mutex);
     configured_scopes.clear();
+    {
+      std::lock_guard<std::mutex> s_lock(scalar_mutex);
+      scalar_accumulators.clear();
+    }
   }
 
   void connect(const char* data_address, const char* announce_address,
                const char* name) {
+    stop_flush_thread();
+
     this->data_address = data_address;
     this->announce_address = announce_address;
     this->name = name;
@@ -201,6 +369,10 @@ class ImscopeProducer {
     workers.clear();
     active_requests.clear();
     acquired_msgs.clear();
+    {
+      std::lock_guard<std::mutex> s_lock(scalar_mutex);
+      scalar_accumulators.clear();
+    }
     if (nng_socket_id(data_socket) > 0) {
       nng_close(data_socket);
     }
@@ -226,16 +398,19 @@ class ImscopeProducer {
 
     announce_handler =
         std::make_unique<AnnounceCtx>(this->announce_socket, this);
+
+    start_flush_thread();
   }
 
-  imscope_return_t add_scope(const char* name, scope_type_t type) {
+  imscope_return_t add_scope(const char* name, scope_type_t type,
+                             const char* group = "") {
     std::lock_guard<std::mutex> lock(scopes_mutex);
     for (size_t i = 0; i < configured_scopes.size(); i++) {
       if (configured_scopes[i].name == name) {
         return IMSCOPE_SUCCESS;
       }
     }
-    scope_info_t scope_info = {name, type};
+    scope_info_t scope_info = {name, group ? group : "", type};
     configured_scopes.push_back(scope_info);
     if (nng_socket_id(data_socket) > 0) {
       workers.push_back(std::make_unique<ScopeCtx>(this->data_socket, this));
@@ -243,14 +418,15 @@ class ImscopeProducer {
     return IMSCOPE_SUCCESS;
   }
 
-  int get_or_register_scope(const char* name, scope_type_t type) {
+  int get_or_register_scope(const char* name, scope_type_t type,
+                            const char* group = "") {
     std::lock_guard<std::mutex> lock(scopes_mutex);
     for (size_t i = 0; i < configured_scopes.size(); i++) {
       if (configured_scopes[i].name == name) {
         return static_cast<int>(i);
       }
     }
-    scope_info_t scope_info = {name, type};
+    scope_info_t scope_info = {name, group ? group : "", type};
     configured_scopes.push_back(scope_info);
     if (nng_socket_id(data_socket) > 0) {
       workers.push_back(std::make_unique<ScopeCtx>(this->data_socket, this));
@@ -505,4 +681,62 @@ extern "C" void imscope_cleanup_producer() {
     delete instance;
     instance = nullptr;
   }
+}
+
+extern "C" imscope_return_t imscope_try_send_int32(int32_t val, int id) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
+  return instance->push_scalar_value(val_u, id);
+}
+
+extern "C" imscope_return_t imscope_try_send_float(float val, int id) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
+  return instance->push_scalar_value(val_u, id);
+}
+
+extern "C" imscope_return_t imscope_try_send_int32_by_name(int32_t val,
+                                                           const char* name) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  int id = instance->get_or_register_scope(name, SCOPE_TYPE_INT32);
+  uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
+  return instance->push_scalar_value(val_u, id);
+}
+
+extern "C" imscope_return_t imscope_try_send_float_by_name(float val,
+                                                           const char* name) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  int id = instance->get_or_register_scope(name, SCOPE_TYPE_FLOAT);
+  uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
+  return instance->push_scalar_value(val_u, id);
+}
+
+extern "C" imscope_return_t imscope_try_send_int32_by_group(int32_t val,
+                                                            const char* name,
+                                                            const char* group) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  int id = instance->get_or_register_scope(name, SCOPE_TYPE_INT32, group);
+  uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
+  return instance->push_scalar_value(val_u, id);
+}
+
+extern "C" imscope_return_t imscope_try_send_float_by_group(float val,
+                                                            const char* name,
+                                                            const char* group) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  int id = instance->get_or_register_scope(name, SCOPE_TYPE_FLOAT, group);
+  uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
+  return instance->push_scalar_value(val_u, id);
 }

@@ -43,6 +43,8 @@ class ImscopeConsumer {
   bool try_collect_iq(int scope_id, std::vector<int16_t>& real,
                       std::vector<int16_t>& imag);
   bool try_collect_real(int scope_id, std::vector<int16_t>& real);
+  bool try_collect_int32(int scope_id, std::vector<int32_t>& values);
+  bool try_collect_float(int scope_id, std::vector<float>& values);
   static ImscopeConsumer* connect(const char* announce_address);
   bool refresh_scopes();
 

@@ -316,3 +316,88 @@ TEST(IntegrationTest, DynamicRegistrationZeroCopyByName) {
   delete consumer;
   imscope_cleanup_producer();
 }
+
+TEST(IntegrationTest, ScalarPublishing) {
+  const char* data_addr = "inproc://data_scalar";
+  const char* announce_addr = "inproc://announce_scalar";
+
+  imscope_scope_desc_t scopes[] = {{"scope_int32", SCOPE_TYPE_INT32},
+                                   {"scope_float", SCOPE_TYPE_FLOAT}};
+
+  imscope_return_t rv = imscope_init_producer(data_addr, announce_addr,
+                                              "ScalarProducer", scopes, 2);
+  ASSERT_EQ(rv, IMSCOPE_SUCCESS);
+
+  ImscopeConsumer* consumer = ImscopeConsumer::connect(announce_addr);
+  ASSERT_NE(consumer, nullptr);
+
+  // Trigger requests
+  consumer->request_data(0);
+  consumer->request_data(1);
+
+  // Sleep slightly to let consumer request reach the producer
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // Send int32 values.
+  for (int32_t i = 0; i < 10; ++i) {
+    imscope_try_send_int32(i * 100, 0);
+  }
+
+  // Send float values by name
+  for (int i = 0; i < 10; ++i) {
+    imscope_try_send_float_by_name(i * 1.5f, "scope_float");
+  }
+
+  // Since we only sent 10, the accumulator will not flush immediately by threshold (256).
+  // We wait 60ms (timeout is 30ms) so it auto-flushes.
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+  for (int32_t i = 0; i < 10; ++i) {
+    imscope_try_send_int32(i * 100, 0);
+  }
+
+  // Send float values by name
+  for (int i = 0; i < 10; ++i) {
+    imscope_try_send_float_by_name(i * 1.5f, "scope_float");
+  }
+
+  // Now consume
+  int handle_int = 0;
+  NngMsgPtr msg_int = nullptr;
+  int retry = 0;
+  while ((msg_int = consumer->try_collect_scope_msg(0, handle_int)) ==
+             nullptr &&
+         retry < 100) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    retry++;
+  }
+  ASSERT_NE(msg_int, nullptr);
+
+  scope_msg_t* m_int = (scope_msg_t*)msg_int.get();
+  EXPECT_EQ(m_int->data_size, 10 * sizeof(int32_t));
+  int32_t* data_int = (int32_t*)(m_int + 1);
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_EQ(data_int[i], i * 100);
+  }
+
+  int handle_float = 0;
+  NngMsgPtr msg_float = nullptr;
+  retry = 0;
+  while ((msg_float = consumer->try_collect_scope_msg(1, handle_float)) ==
+             nullptr &&
+         retry < 100) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    retry++;
+  }
+  ASSERT_NE(msg_float, nullptr);
+
+  scope_msg_t* m_float = (scope_msg_t*)msg_float.get();
+  EXPECT_EQ(m_float->data_size, 10 * sizeof(float));
+  float* data_float = (float*)(m_float + 1);
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_NEAR(data_float[i], i * 1.5f, 1e-5f);
+  }
+
+  delete consumer;
+  imscope_cleanup_producer();
+}
