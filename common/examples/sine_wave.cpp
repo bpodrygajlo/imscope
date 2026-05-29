@@ -7,6 +7,7 @@
 
 #include <spdlog/spdlog.h>
 #include <unistd.h>
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <vector>
@@ -31,12 +32,22 @@ int main() {
   while (true) {
     std::vector<uint32_t> data(samples_per_batch);
     for (int i = 0; i < samples_per_batch; i++) {
-      // Generate a sine wave scaled to 1000 range
-      double val = 500.0 + 400.0 * std::sin(phase);
-      data[i] = static_cast<uint32_t>(val);
+      // Generate two int16_t samples for each uint32_t element
+      double val1 = 400.0 * std::sin(phase);
       phase += 2.0 * M_PI * freq;
       if (phase > 2.0 * M_PI)
         phase -= 2.0 * M_PI;
+
+      double val2 = 400.0 * std::sin(phase);
+      phase += 2.0 * M_PI * freq;
+      if (phase > 2.0 * M_PI)
+        phase -= 2.0 * M_PI;
+
+      int16_t s1 = static_cast<int16_t>(std::clamp(val1, -32768.0, 32767.0));
+      int16_t s2 = static_cast<int16_t>(std::clamp(val2, -32768.0, 32767.0));
+
+      data[i] = (static_cast<uint32_t>(static_cast<uint16_t>(s1))) |
+                (static_cast<uint32_t>(static_cast<uint16_t>(s2)) << 16);
     }
 
     // Send data to scope 0
@@ -49,7 +60,7 @@ int main() {
     }
 
     std::cout << "\rProduced batch at timestamp: " << timestamp << std::flush;
-    timestamp += samples_per_batch;
+    timestamp += 2 * samples_per_batch;
 
     // Control the flow a bit
     usleep(50000);  // 50ms sleep

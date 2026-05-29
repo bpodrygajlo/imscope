@@ -82,12 +82,22 @@ int main() {
 
     for (int i = 0; i < samples_per_batch; i++) {
       if (enabled) {
-        // Generate wave
-        double val = 500.0 + static_cast<double>(amp) * std::sin(phase);
-        data[i] = static_cast<uint32_t>(std::max(0.0, val));
+        // Generate two int16_t samples for each uint32_t element
+        double val1 = static_cast<double>(amp) * std::sin(phase);
         phase += 2.0 * M_PI * static_cast<double>(freq);
         if (phase > 2.0 * M_PI)
           phase -= 2.0 * M_PI;
+
+        double val2 = static_cast<double>(amp) * std::sin(phase);
+        phase += 2.0 * M_PI * static_cast<double>(freq);
+        if (phase > 2.0 * M_PI)
+          phase -= 2.0 * M_PI;
+
+        int16_t s1 = static_cast<int16_t>(std::clamp(val1, -32768.0, 32767.0));
+        int16_t s2 = static_cast<int16_t>(std::clamp(val2, -32768.0, 32767.0));
+
+        data[i] = (static_cast<uint32_t>(static_cast<uint16_t>(s1))) |
+                  (static_cast<uint32_t>(static_cast<uint16_t>(s2)) << 16);
       } else {
         data[i] = 0;
       }
@@ -102,7 +112,7 @@ int main() {
       continue;
     }
 
-    timestamp += samples_per_batch;
+    timestamp += 2 * samples_per_batch;
     usleep(50000);  // 50ms sleep
   }
 
