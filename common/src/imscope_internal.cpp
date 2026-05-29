@@ -75,8 +75,22 @@ void print_announce_response(announce_response_t* msg) {
   std::cout << "---------------------------------" << std::endl;
   std::cout << "Number of scopes: " << msg->num_scopes << std::endl;
   for (int i = 0; i < msg->num_scopes; i++) {
-    std::cout << "  Scope " << i << ": " << msg->scopes[i].name << " Type: "
-              << (msg->scopes[i].type == SCOPE_TYPE_REAL ? "REAL" : "IQ_DATA")
-              << std::endl;
+    const char* type_str = "UNKNOWN";
+    switch (msg->scopes[i].type) {
+      case SCOPE_TYPE_REAL:
+        type_str = "REAL";
+        break;
+      case SCOPE_TYPE_IQ_DATA:
+        type_str = "IQ_DATA";
+        break;
+      case SCOPE_TYPE_INT32:
+        type_str = "INT32";
+        break;
+      case SCOPE_TYPE_FLOAT:
+        type_str = "FLOAT";
+        break;
+    }
+    std::cout << "  Scope " << i << ": " << msg->scopes[i].name
+              << " Type: " << type_str << std::endl;
   }
 }

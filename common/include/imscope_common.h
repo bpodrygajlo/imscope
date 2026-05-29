@@ -18,6 +18,7 @@
 
 #define MAX_OFFSETS 14
 #define MAX_SCOPE_NAME_LEN 64
+#define MAX_GROUP_NAME_LEN 64
 #define ANNOUNCE_MSG_ID 0xABCDEF01
 
 typedef struct {
@@ -37,6 +38,8 @@ typedef enum {
 typedef enum {
   SCOPE_TYPE_REAL = 0,
   SCOPE_TYPE_IQ_DATA = 1,
+  SCOPE_TYPE_INT32 = 2,
+  SCOPE_TYPE_FLOAT = 3,
 } scope_type_t;
 
 typedef struct {
@@ -54,6 +57,7 @@ typedef struct {
 
 typedef struct {
   char name[MAX_SCOPE_NAME_LEN];
+  char group[MAX_GROUP_NAME_LEN];
   scope_type_t type;
 } imscope_scope_config_t;
 
@@ -75,5 +79,46 @@ typedef struct {
   uint32_t magic;
   int32_t scope_id;
 } scope_request_t;
+
+typedef enum {
+  SETTING_TYPE_BOOL = 0,
+  SETTING_TYPE_INT32 = 1,
+  SETTING_TYPE_FLOAT = 2
+} setting_type_t;
+
+typedef struct {
+  char name[64];
+  setting_type_t type;
+
+  union {
+    uint8_t bval;
+    int32_t ival;
+    float fval;
+  } value;
+} imscope_setting_t;
+
+#define SETTING_REQ_GET_ALL 0xABCDEF10
+#define SETTING_REQ_SET 0xABCDEF11
+#define SETTING_REP_GET_ALL 0xABCDEF20
+#define SETTING_REP_SET 0xABCDEF21
+
+typedef struct {
+  uint32_t magic;
+  char name[64];
+  setting_type_t type;
+
+  union {
+    uint8_t bval;
+    int32_t ival;
+    float fval;
+  } value;
+} setting_request_t;
+
+typedef struct {
+  uint32_t magic;
+  int32_t status;
+  int32_t num_settings;
+  imscope_setting_t settings[1];
+} setting_response_t;
 
 #endif

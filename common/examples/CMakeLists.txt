@@ -12,3 +12,9 @@ target_link_libraries(sine_wave PRIVATE imscope_producer spdlog)
 
 add_executable(zero_copy zero_copy.cpp)
 target_link_libraries(zero_copy PRIVATE imscope_producer imscope_internal)
+
+add_executable(scalar_producer scalar_producer.cpp)
+target_link_libraries(scalar_producer PRIVATE imscope_producer spdlog)
+
+add_executable(settings_example settings_example.cpp)
+target_link_libraries(settings_example PRIVATE imscope_producer spdlog)

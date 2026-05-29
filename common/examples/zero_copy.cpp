@@ -13,7 +13,7 @@
 #include "imscope_producer.h"
 
 int main() {
-  imscope_scope_desc_t scopes[] = {{"zero_copy_sine", SCOPE_TYPE_REAL}};
+  imscope_scope_desc_t scopes[] = {{"zero_copy_sine", SCOPE_TYPE_FLOAT}};
 
   imscope_return_t rv =
       imscope_init_producer("tcp://127.0.0.1:5555", "tcp://127.0.0.1:5556",
