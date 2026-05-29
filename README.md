@@ -1,114 +1,153 @@
 # imscope
 
-imscope is a real-time IQ data visualization tool designed for high-data-rate applications, such as 5G stacks. It allows developers to visualize signal data in real-time using various plot types.
+`imscope` is a real-time signal and IQ data visualization tool designed for high-data-rate applications, such as 5G protocol stacks. It allows developers to visualize live signal streams concurrently using multiple interactive plotting methods.
+
+The project features a **C++ core producer library** and **two Rust-based clients** (a TUI and a GPU-accelerated GUI).
+
+---
+
+## Architecture Overview
+
+```
+ [ C++ Data Producer ] (e.g. 5G Stack / RF Simulator)
+        │
+        ▼ (NNG Protocol)
+ ┌──────────────────────────────────────┐
+ │         Rust Clients                 │
+ │  ┌────────────────────────────────┐  │
+ │  │        imscope-gui             │  │
+ │  │  (Dear ImGui + ImPlot + wgpu)  │  │
+ │  └────────────────────────────────┘  │
+ │  ┌────────────────────────────────┐  │
+ │  │        imscope-tui             │  │
+ │  │        (Ratatui)               │  │
+ │  └────────────────────────────────┘  │
+ └──────────────────────────────────────┘
+```
+
+---
 
 ## Features
 
-*   **Real-time Visualization:** Plot IQ data as it is produced.
-*   **Multiple Plot Types:**
-    *   Scatterplot (Constellation diagram)
-    *   Histogram (IQ distribution)
-    *   RMS (Power over time/samples)
-*   **Remote Connection:** Connect to data producers via TCP using the NNG library.
-*   **Ingress Filtering:** Filter out noise based on linear magnitude or percentage of samples.
-*   **Data Stacking:** Collect and stack samples by timestamp for deeper analysis.
-*   **Modern GUI:** Built with [Dear ImGui](https://github.com/ocornut/imgui) and [ImPlot](https://github.com/epezent/implot).
+*   **Real-time Visualization:** Plot signal data with minimal latency as it is generated.
+*   **Multiple Plot Modes:**
+    *   **Scatter / Constellation (IQ):** Visualizes the complex symbol constellation.
+    *   **RMS Power:** Plots root-mean-square power over samples.
+    *   **Waveform:** Shows the real and imaginary components over time.
+    *   **Histogram (1D):** Amplitude distribution of real/imaginary parts.
+    *   **2D Density:** Bivariate heatmaps of IQ distribution.
+*   **Remote Connection:** Asynchronous, non-blocking discovery and data transport using the **NNG** library.
+*   **State Management:**
+    *   **Signal Filters:** Live noise filtering based on magnitude cutoffs or sample percentages.
+    *   **Data Stacking:** Custom sample stacking sizes for deeper visual analysis.
+    *   **Group View:** Automatically merges and overlays plots of scopes belonging to the same group.
+
+---
 
 ## Prerequisites
 
-To build imscope, you need the following dependencies:
-
+### 1. C++ Core Library (Producer)
+To build the C++ producer library, examples, and tests:
 *   **CMake** (>= 3.10)
-*   **C++17 Compiler** (GCC, Clang, MSVC)
-*   **NNG** (Communication library)
-*   **OpenGL** (Graphics API)
-*   **GLFW3** (Windowing and input)
+*   **C++17 Compiler** (GCC, Clang, or MSVC)
+*   **NNG** (automatically fetched or system-installed)
 
-Dependencies like `spdlog`, `imgui`, and `implot` are automatically managed via CMake/CPM.
+### 2. Rust Clients (GUI & TUI)
+To build the graphical or terminal clients:
+*   **Rust Toolchain** (Cargo, standard edition)
+*   **Graphics Backend** (Vulkan, Metal, or OpenGL drivers for GPU rendering in the GUI)
+
+---
 
 ## Build Instructions
 
+### Building the C++ Core & Examples
 ```bash
 mkdir build
 cd build
 cmake ..
 make -j
 ```
+This compiles the core producer library and testing binaries (e.g., `settings_example`).
+
+### Building the Rust Clients
+From the project root directory, compile the TUI and GUI clients using Cargo:
+```bash
+cargo build --release
+```
+The compiled binaries will be located in `target/release/imscope-gui` and `target/release/imscope-tui`.
+
+---
 
 ## Usage
 
-### Running the Application
-
-After building, run the `imscope` executable:
-
+### 1. Starting the Data Producer
+Run the settings/data example to start generating dummy signals:
 ```bash
-./imscope
+./build/common/examples/settings_example
 ```
 
-1.  **Connect to a Producer:**
-    *   In the "Connected consumers" window, enter the address of the producer (default: `tcp://127.0.0.1:5557`).
-    *   Click "Connect".
-2.  **Select a Scope:**
-    *   Once connected, a list of available scopes (data streams) will appear.
-    *   Select a scope and click "Open scope window".
-3.  **Visualize Data:**
-    *   In the scope window, click "Request data" or check "Automatically collect data" for real-time updates.
-    *   Choose between "Histogram", "RMS", or "Scatter" plot types.
-    *   Adjust settings like ingress filtering or histogram bins as needed.
+### 2. Launching the GUI Client (GPU-accelerated)
+Run the Rust GUI client:
+```bash
+cargo run --release --bin imscope-gui
+# Or run the compiled binary:
+./target/release/imscope-gui
+```
+*   **Control Center:** Configure the Announcer URL (default `tcp://127.0.0.1:5557`) and click **Connect**.
+*   **Layout Setup:** Switch between **1 Pane** or **2 Panes** layout to monitor multiple scopes side-by-side.
+*   **Live Parameter Controls:** Toggle Auto-Collect, modify sample filters, adjust Stacking Size, and dynamically update Producer parameters under the **Producer Dynamic Settings** collapsible tree.
+*   **Visual Tabs:** Switch between visual tabs (**Scatter**, **RMS Power**, **Waveform**, **Histogram**, and **2D Density**) to view the data.
 
-### Integrating into your Application
+### 3. Launching the TUI Client (Terminal-based)
+Run the Rust terminal client:
+```bash
+cargo run --release --bin imscope-tui
+# Or run the compiled binary:
+./target/release/imscope-tui
+```
+*   Use standard terminal mouse interaction or keyboard shortcuts to toggle views.
+*   Configure signal filters and stacking parameters directly from the sidebar.
 
-To visualize data from your application, you need to use the `imscope` producer API.
+---
 
-1.  **Include the Header:**
-    ```c
-    #include "imscope_producer.h"
-    ```
+## Integrating the Producer API
+To send signal data from your own application, include the producer header:
+```c
+#include "imscope_producer.h"
+```
 
-2.  **Initialize the Producer:**
-    Define the scopes (data streams) you want to expose.
-
+1.  **Initialize the Producer:**
     ```c
     imscope_scope_desc_t scopes[] = {
-        {"Scope 1", SCOPE_TYPE_IQ_DATA},
-        {"Scope 2", SCOPE_TYPE_IQ_DATA}
+        {"Channel A", SCOPE_TYPE_IQ_DATA, "Group 1"},
+        {"Channel B", SCOPE_TYPE_IQ_DATA, "Group 1"}
     };
 
-    // Initialize producer with addresses for data and announce sockets
     imscope_init_producer(
-        "tcp://0.0.0.0:5558", // Data address
-        "tcp://0.0.0.0:5559", // Announce address
-        "My Producer",        // Producer name
-        scopes,               // Scope definitions
-        2                     // Number of scopes
+        "tcp://0.0.0.0:5558", // Data socket bind address
+        "tcp://0.0.0.0:5559", // Announce socket bind address
+        "My Producer",
+        scopes,
+        2
     );
     ```
 
-3.  **Send Data:**
-    Send IQ data (interleaved 16-bit integers usually, based on `uint32_t*` signature implying packed complex IQ).
-
+2.  **Send Data:**
     ```c
-    // Example: Sending data to Scope 1 (ID 0)
-    std::vector<uint32_t> iq_data = ...; // Your IQ data
-    int frame = 0;
-    int slot = 0;
-    uint64_t timestamp = ...;
-
-    imscope_return_t ret = imscope_try_send_data(
-        iq_data.data(),
-        0,              // Scope ID (index in the scopes array)
-        iq_data.size(), // Number of samples
+    std::vector<uint32_t> iq_samples = ...; // Interleaved 16-bit complex IQ
+    imscope_try_send_data(
+        iq_samples.data(),
+        0,                 // Scope ID
+        iq_samples.size(), // Sample count
         frame,
         slot,
         timestamp
     );
-    if (ret != IMSCOPE_SUCCESS) {
-        // Handle error or busy state
-    }
     ```
+
+---
 
 ## License
 
-This project is licensed under the **MIT License**. This allows for easy integration and modification for both open-source and proprietary applications.
-
-See the [LICENSE](LICENSE) file for the full license text.
+This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for the full text.

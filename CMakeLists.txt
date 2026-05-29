@@ -21,14 +21,9 @@ endif()
 option(IMSCOPE_BUILD_EXAMPLES "Build examples" ON)
 
 
-option(IMSCOPE_BUILD_GUI "Build GUI" ON)
-
 if(NOT DEFINED ENV{CPM_SOURCE_CACHE})
   set(CPM_SOURCE_CACHE ~/.cache/cpm/ CACHE FILEPATH "Directory to download CPM dependencies")
 endif()
 include("cmake/get_cpm.cmake")
 
 add_subdirectory(common)
-if(IMSCOPE_BUILD_GUI)
-    add_subdirectory(gui)
-endif()
