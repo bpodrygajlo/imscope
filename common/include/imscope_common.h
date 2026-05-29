@@ -80,4 +80,45 @@ typedef struct {
   int32_t scope_id;
 } scope_request_t;
 
+typedef enum {
+  SETTING_TYPE_BOOL = 0,
+  SETTING_TYPE_INT32 = 1,
+  SETTING_TYPE_FLOAT = 2
+} setting_type_t;
+
+typedef struct {
+  char name[64];
+  setting_type_t type;
+
+  union {
+    uint8_t bval;
+    int32_t ival;
+    float fval;
+  } value;
+} imscope_setting_t;
+
+#define SETTING_REQ_GET_ALL 0xABCDEF10
+#define SETTING_REQ_SET 0xABCDEF11
+#define SETTING_REP_GET_ALL 0xABCDEF20
+#define SETTING_REP_SET 0xABCDEF21
+
+typedef struct {
+  uint32_t magic;
+  char name[64];
+  setting_type_t type;
+
+  union {
+    uint8_t bval;
+    int32_t ival;
+    float fval;
+  } value;
+} setting_request_t;
+
+typedef struct {
+  uint32_t magic;
+  int32_t status;
+  int32_t num_settings;
+  imscope_setting_t settings[1];
+} setting_response_t;
+
 #endif

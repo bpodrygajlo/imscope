@@ -393,6 +393,129 @@ pub fn check_noise_filter(
     noise_percentage <= noise_cutoff_percentage
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum SettingType {
+    Bool = 0,
+    Int32 = 1,
+    Float = 2,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingValue {
+    Bool(bool),
+    Int32(i32),
+    Float(f32),
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingInfo {
+    pub name: String,
+    pub setting_type: SettingType,
+    pub value: SettingValue,
+}
+
+pub const SETTING_REQ_GET_ALL: u32 = 0xABCDEF10;
+pub const SETTING_REQ_SET: u32 = 0xABCDEF11;
+pub const SETTING_REP_GET_ALL: u32 = 0xABCDEF20;
+pub const SETTING_REP_SET: u32 = 0xABCDEF21;
+
+pub fn build_get_all_request() -> Vec<u8> {
+    let mut bytes = vec![0u8; 76];
+    bytes[0..4].copy_from_slice(&SETTING_REQ_GET_ALL.to_ne_bytes());
+    bytes
+}
+
+pub fn build_set_request(name: &str, stype: SettingType, val: &SettingValue) -> Vec<u8> {
+    let mut bytes = vec![0u8; 76];
+    bytes[0..4].copy_from_slice(&SETTING_REQ_SET.to_ne_bytes());
+
+    // Copy name
+    let name_bytes = name.as_bytes();
+    let copy_len = name_bytes.len().min(63);
+    bytes[4..4 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
+
+    // Type
+    let type_val = stype as i32;
+    bytes[68..72].copy_from_slice(&type_val.to_ne_bytes());
+
+    // Value
+    match val {
+        SettingValue::Bool(b) => {
+            bytes[72] = if *b { 1 } else { 0 };
+        }
+        SettingValue::Int32(i) => {
+            bytes[72..76].copy_from_slice(&i.to_ne_bytes());
+        }
+        SettingValue::Float(f) => {
+            bytes[72..76].copy_from_slice(&f.to_ne_bytes());
+        }
+    }
+
+    bytes
+}
+
+pub fn parse_setting_response(bytes: &[u8]) -> Result<(i32, Vec<SettingInfo>), String> {
+    if bytes.len() < 12 {
+        return Err("Response too short".into());
+    }
+    let magic = u32::from_ne_bytes(bytes[0..4].try_into().unwrap());
+    let status = i32::from_ne_bytes(bytes[4..8].try_into().unwrap());
+    let num_settings = i32::from_ne_bytes(bytes[8..12].try_into().unwrap());
+
+    if magic == SETTING_REP_SET {
+        return Ok((status, Vec::new()));
+    }
+
+    if magic != SETTING_REP_GET_ALL {
+        return Err(format!("Invalid response magic: {:#X}", magic));
+    }
+
+    let mut settings = Vec::new();
+    let expected_len = 12 + (num_settings as usize) * 72;
+    if bytes.len() < expected_len {
+        return Err(format!(
+            "Response size {} smaller than expected {} for {} settings",
+            bytes.len(),
+            expected_len,
+            num_settings
+        ));
+    }
+
+    for i in 0..(num_settings as usize) {
+        let offset = 12 + i * 72;
+        let name_bytes = &bytes[offset..offset + 64];
+        let name = parse_c_str(name_bytes)?;
+
+        let type_val = i32::from_ne_bytes(bytes[offset + 64..offset + 68].try_into().unwrap());
+        let stype = match type_val {
+            0 => SettingType::Bool,
+            1 => SettingType::Int32,
+            2 => SettingType::Float,
+            _ => return Err(format!("Unknown setting type {}", type_val)),
+        };
+
+        let val_bytes = &bytes[offset + 68..offset + 72];
+        let value = match stype {
+            SettingType::Bool => SettingValue::Bool(val_bytes[0] != 0),
+            SettingType::Int32 => {
+                SettingValue::Int32(i32::from_ne_bytes(val_bytes.try_into().unwrap()))
+            }
+            SettingType::Float => {
+                SettingValue::Float(f32::from_ne_bytes(val_bytes.try_into().unwrap()))
+            }
+        };
+
+        settings.push(SettingInfo {
+            name,
+            setting_type: stype,
+            value,
+        });
+    }
+
+    Ok((status, settings))
+}
+
 // Commands from TUI to Worker thread
 pub enum WorkerCommand {
     Connect {
@@ -413,6 +536,12 @@ pub enum WorkerCommand {
         percentage: f32,
     },
     RefreshScopes,
+    GetSettings,
+    UpdateSetting {
+        name: String,
+        setting_type: SettingType,
+        value: SettingValue,
+    },
 }
 
 // Events from Worker to TUI thread
@@ -433,10 +562,18 @@ pub enum WorkerEvent {
     ScopesRefreshed {
         scopes: Vec<ScopeConfig>,
     },
+    SettingsRefreshed {
+        settings: Vec<SettingInfo>,
+    },
+    SettingUpdated {
+        name: String,
+        status: i32,
+    },
 }
 
 pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>) {
     let mut data_socket: Option<Socket> = None;
+    let mut control_socket: Option<Socket> = None;
     let mut selected_scopes: Vec<(usize, ScopeType)> = Vec::new();
     let mut scope_cycle_idx: usize = 0;
     let mut auto_collect = true;
@@ -464,46 +601,90 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
                     let _ = event_tx.send(WorkerEvent::Connecting);
                     match perform_announce(&url) {
                         Ok(ann) => {
-                            // Announce successful. Create data socket.
+                            let mut d_sock = None;
+                            let mut c_sock = None;
                             match Socket::new(Protocol::Req0) {
-                                Ok(sock) => {
-                                    match sock.dial(&ann.data_address) {
-                                        Ok(_) => {
-                                            // Set data recv timeout to 1 second
-                                            let _ = sock.set_opt::<RecvTimeout>(Some(
-                                                Duration::from_secs(1),
-                                            ));
-                                            data_socket = Some(sock);
-                                            let _ = event_tx.send(WorkerEvent::Connected {
-                                                name: ann.name,
-                                                data_address: ann.data_address,
-                                                control_address: ann.control_address,
-                                                scopes: ann.scopes,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            let _ = event_tx.send(WorkerEvent::ConnectionFailed(
-                                                format!(
-                                                    "Failed to dial data address {}: {}",
-                                                    ann.data_address, e
-                                                ),
-                                            ));
-                                            data_socket = None;
-                                        }
+                                Ok(sock) => match sock.dial(&ann.data_address) {
+                                    Ok(_) => {
+                                        let _ = sock
+                                            .set_opt::<RecvTimeout>(Some(Duration::from_secs(1)));
+                                        d_sock = Some(sock);
                                     }
-                                }
+                                    Err(e) => {
+                                        let _ =
+                                            event_tx.send(WorkerEvent::ConnectionFailed(format!(
+                                                "Failed to dial data address {}: {}",
+                                                ann.data_address, e
+                                            )));
+                                    }
+                                },
                                 Err(e) => {
                                     let _ = event_tx.send(WorkerEvent::ConnectionFailed(format!(
                                         "Failed to create data socket: {}",
                                         e
                                     )));
-                                    data_socket = None;
                                 }
+                            }
+
+                            if d_sock.is_some() {
+                                match Socket::new(Protocol::Req0) {
+                                    Ok(sock) => match sock.dial(&ann.control_address) {
+                                        Ok(_) => {
+                                            let _ = sock.set_opt::<RecvTimeout>(Some(
+                                                Duration::from_secs(1),
+                                            ));
+                                            c_sock = Some(sock);
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx.send(WorkerEvent::Error(format!(
+                                                "Failed to dial control address {}: {}",
+                                                ann.control_address, e
+                                            )));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        let _ = event_tx.send(WorkerEvent::Error(format!(
+                                            "Failed to create control socket: {}",
+                                            e
+                                        )));
+                                    }
+                                }
+                            }
+
+                            if d_sock.is_some() {
+                                data_socket = d_sock;
+                                control_socket = c_sock;
+                                let _ = event_tx.send(WorkerEvent::Connected {
+                                    name: ann.name,
+                                    data_address: ann.data_address,
+                                    control_address: ann.control_address,
+                                    scopes: ann.scopes,
+                                });
+                                // Automatically fetch initial settings when connected
+                                if let Some(ref sock) = control_socket {
+                                    let req = build_get_all_request();
+                                    if sock.send(&req).is_ok() {
+                                        if let Ok(reply) = sock.recv() {
+                                            if let Ok((_status, settings)) =
+                                                parse_setting_response(&reply)
+                                            {
+                                                let _ =
+                                                    event_tx.send(WorkerEvent::SettingsRefreshed {
+                                                        settings,
+                                                    });
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                data_socket = None;
+                                control_socket = None;
                             }
                         }
                         Err(e) => {
                             let _ = event_tx.send(WorkerEvent::ConnectionFailed(e));
                             data_socket = None;
+                            control_socket = None;
                         }
                     }
                 }
@@ -562,11 +743,97 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
                             Ok(ann) => {
                                 let _ = event_tx
                                     .send(WorkerEvent::ScopesRefreshed { scopes: ann.scopes });
+                                // Also fetch settings when scopes are refreshed
+                                if let Some(ref sock) = control_socket {
+                                    let req = build_get_all_request();
+                                    if sock.send(&req).is_ok() {
+                                        if let Ok(reply) = sock.recv() {
+                                            if let Ok((_status, settings)) =
+                                                parse_setting_response(&reply)
+                                            {
+                                                let _ =
+                                                    event_tx.send(WorkerEvent::SettingsRefreshed {
+                                                        settings,
+                                                    });
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 let _ = event_tx.send(WorkerEvent::Error(format!(
                                     "Failed to refresh scopes: {}",
                                     e
+                                )));
+                            }
+                        }
+                    }
+                }
+                WorkerCommand::GetSettings => {
+                    if let Some(ref sock) = control_socket {
+                        let req = build_get_all_request();
+                        match sock.send(&req) {
+                            Ok(_) => match sock.recv() {
+                                Ok(reply) => match parse_setting_response(&reply) {
+                                    Ok((_status, settings)) => {
+                                        let _ = event_tx
+                                            .send(WorkerEvent::SettingsRefreshed { settings });
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(WorkerEvent::Error(format!(
+                                            "Failed to parse settings: {}",
+                                            e
+                                        )));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = event_tx.send(WorkerEvent::Error(format!(
+                                        "Failed to receive settings: {}",
+                                        e
+                                    )));
+                                }
+                            },
+                            Err(e) => {
+                                let _ = event_tx.send(WorkerEvent::Error(format!(
+                                    "Failed to send settings request: {}",
+                                    e.1
+                                )));
+                            }
+                        }
+                    }
+                }
+                WorkerCommand::UpdateSetting {
+                    name,
+                    setting_type,
+                    value,
+                } => {
+                    if let Some(ref sock) = control_socket {
+                        let req = build_set_request(&name, setting_type, &value);
+                        match sock.send(&req) {
+                            Ok(_) => match sock.recv() {
+                                Ok(reply) => match parse_setting_response(&reply) {
+                                    Ok((status, _)) => {
+                                        let _ = event_tx
+                                            .send(WorkerEvent::SettingUpdated { name, status });
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(WorkerEvent::Error(format!(
+                                            "Failed to parse update reply: {}",
+                                            e
+                                        )));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = event_tx.send(WorkerEvent::Error(format!(
+                                        "Failed to receive update reply: {}",
+                                        e
+                                    )));
+                                }
+                            },
+                            Err(e) => {
+                                let _ = event_tx.send(WorkerEvent::Error(format!(
+                                    "Failed to send update request: {}",
+                                    e.1
                                 )));
                             }
                         }

@@ -25,6 +25,37 @@
 
 #include "imscope_producer.h"
 
+static std::string derive_control_address(const std::string& announce_addr) {
+  if (announce_addr.rfind("tcp://", 0) == 0) {
+    size_t colon = announce_addr.rfind(':');
+    if (colon != std::string::npos) {
+      std::string port_str = announce_addr.substr(colon + 1);
+      try {
+        int port = std::stoi(port_str);
+        return announce_addr.substr(0, colon + 1) + std::to_string(port + 1);
+      } catch (...) {
+        // Fallback
+      }
+    }
+  }
+  return announce_addr + "-control";
+}
+
+struct SettingInfo {
+  std::string name;
+  setting_type_t type;
+
+  union {
+    bool bval;
+    int32_t ival;
+    float fval;
+  } value;
+
+  imscope_setting_bool_cb_t bool_cb = nullptr;
+  imscope_setting_int32_cb_t int32_cb = nullptr;
+  imscope_setting_float_cb_t float_cb = nullptr;
+};
+
 typedef struct {
   std::string name;
   std::string group;
@@ -132,6 +163,8 @@ class ImscopeProducer {
             msg->num_scopes = self->parent->configured_scopes.size();
             strncpy(msg->data_address, self->parent->data_address.c_str(),
                     sizeof(msg->data_address) - 1);
+            strncpy(msg->control_address, self->parent->control_address.c_str(),
+                    sizeof(msg->control_address) - 1);
             strncpy(msg->name, self->parent->name.c_str(),
                     sizeof(msg->name) - 1);
             for (size_t i = 0; i < self->parent->configured_scopes.size();
@@ -147,9 +180,10 @@ class ImscopeProducer {
 
             spdlog::debug(
                 "ImscopeProducer: Announced {} scopes to consumer."
-                "Data address: {} Announce address: {}",
+                "Data address: {} Announce address: {} Control address: {}",
                 self->parent->configured_scopes.size(),
-                self->parent->data_address, self->parent->announce_address);
+                self->parent->data_address, self->parent->announce_address,
+                self->parent->control_address);
 
             // Send response asynchronously
             nng_aio_set_msg(self->send_aio, res_msg);
@@ -165,12 +199,127 @@ class ImscopeProducer {
     }
   };
 
+  struct SettingsCtx {
+    nng_ctx ctx;
+    nng_aio* send_aio;
+    nng_aio* recv_aio;
+    ImscopeProducer* parent;
+
+    SettingsCtx(nng_socket socket, ImscopeProducer* p) : parent(p) {
+      nng_ctx_open(&ctx, socket);
+      nng_aio_alloc(&send_aio, NULL, NULL);
+      nng_aio_alloc(&recv_aio, settings_callback, this);
+      nng_ctx_recv(ctx, recv_aio);
+    }
+
+    ~SettingsCtx() {
+      nng_aio_free(send_aio);
+      nng_aio_free(recv_aio);
+      nng_ctx_close(ctx);
+    }
+
+    static void settings_callback(void* arg) {
+      auto self = static_cast<SettingsCtx*>(arg);
+      int rv = nng_aio_result(self->recv_aio);
+      if (rv == 0) {
+        nng_msg* req_msg = nng_aio_get_msg(self->recv_aio);
+        if (nng_msg_len(req_msg) >= sizeof(setting_request_t)) {
+          setting_request_t* req = (setting_request_t*)nng_msg_body(req_msg);
+          if (req->magic == SETTING_REQ_GET_ALL) {
+            std::lock_guard<std::mutex> lock(self->parent->settings_mutex);
+            size_t num_settings = self->parent->registered_settings.size();
+            size_t size = sizeof(setting_response_t);
+            if (num_settings > 1) {
+              size += (num_settings - 1) * sizeof(imscope_setting_t);
+            } else if (num_settings == 0) {
+              size -= sizeof(imscope_setting_t);
+            }
+            nng_msg* res_msg;
+            nng_msg_alloc(&res_msg, size);
+            setting_response_t* res =
+                (setting_response_t*)nng_msg_body(res_msg);
+            res->magic = SETTING_REP_GET_ALL;
+            res->status = 0;
+            res->num_settings = num_settings;
+            for (size_t i = 0; i < num_settings; i++) {
+              const auto& s = self->parent->registered_settings[i];
+              strncpy(res->settings[i].name, s.name.c_str(),
+                      sizeof(res->settings[i].name) - 1);
+              res->settings[i].name[sizeof(res->settings[i].name) - 1] = '\0';
+              res->settings[i].type = s.type;
+              if (s.type == SETTING_TYPE_BOOL) {
+                res->settings[i].value.bval = s.value.bval ? 1 : 0;
+              } else if (s.type == SETTING_TYPE_INT32) {
+                res->settings[i].value.ival = s.value.ival;
+              } else if (s.type == SETTING_TYPE_FLOAT) {
+                res->settings[i].value.fval = s.value.fval;
+              }
+            }
+            nng_aio_set_msg(self->send_aio, res_msg);
+            nng_ctx_send(self->ctx, self->send_aio);
+          } else if (req->magic == SETTING_REQ_SET) {
+            std::lock_guard<std::mutex> lock(self->parent->settings_mutex);
+            bool found = false;
+            int status = -1;
+            for (auto& s : self->parent->registered_settings) {
+              if (strncmp(s.name.c_str(), req->name, sizeof(req->name)) == 0) {
+                found = true;
+                if (s.type == req->type) {
+                  if (s.type == SETTING_TYPE_BOOL) {
+                    s.value.bval = req->value.bval != 0;
+                    if (s.bool_cb)
+                      s.bool_cb(s.value.bval);
+                  } else if (s.type == SETTING_TYPE_INT32) {
+                    s.value.ival = req->value.ival;
+                    if (s.int32_cb)
+                      s.int32_cb(s.value.ival);
+                  } else if (s.type == SETTING_TYPE_FLOAT) {
+                    s.value.fval = req->value.fval;
+                    if (s.float_cb)
+                      s.float_cb(s.value.fval);
+                  }
+                  status = 0;
+                } else {
+                  status = -2;  // type mismatch
+                }
+                break;
+              }
+            }
+            if (!found) {
+              status = -3;  // not found
+            }
+            nng_msg* res_msg;
+            nng_msg_alloc(&res_msg, sizeof(setting_response_t) -
+                                        sizeof(imscope_setting_t));
+            setting_response_t* res =
+                (setting_response_t*)nng_msg_body(res_msg);
+            res->magic = SETTING_REP_SET;
+            res->status = status;
+            res->num_settings = 0;
+            nng_aio_set_msg(self->send_aio, res_msg);
+            nng_ctx_send(self->ctx, self->send_aio);
+          }
+        }
+        nng_msg_free(req_msg);
+        nng_ctx_recv(self->ctx, self->recv_aio);
+      } else if (rv != (int)NNG_ECLOSED) {
+        nng_ctx_recv(self->ctx, self->recv_aio);
+      }
+    }
+  };
+
   std::vector<std::unique_ptr<ScopeCtx>> workers;
   std::unique_ptr<AnnounceCtx> announce_handler;
+  std::unique_ptr<SettingsCtx> settings_handler;
   std::map<int, ScopeCtx*> active_requests;
   std::mutex active_requests_mutex;
   std::mutex scopes_mutex;
   std::mutex acquired_msgs_mutex;
+
+  std::mutex settings_mutex;
+  std::vector<SettingInfo> registered_settings;
+  std::string control_address;
+  nng_socket control_socket = NNG_SOCKET_INITIALIZER;
 
   std::mutex scalar_mutex;
   std::thread flush_thread;
@@ -330,13 +479,77 @@ class ImscopeProducer {
   }
 
  public:
+  imscope_return_t register_setting_bool(const char* name, bool initial_val,
+                                         imscope_setting_bool_cb_t callback) {
+    std::lock_guard<std::mutex> lock(settings_mutex);
+    for (auto& s : registered_settings) {
+      if (s.name == name) {
+        s.type = SETTING_TYPE_BOOL;
+        s.value.bval = initial_val;
+        s.bool_cb = callback;
+        return IMSCOPE_SUCCESS;
+      }
+    }
+    SettingInfo s;
+    s.name = name;
+    s.type = SETTING_TYPE_BOOL;
+    s.value.bval = initial_val;
+    s.bool_cb = callback;
+    registered_settings.push_back(s);
+    return IMSCOPE_SUCCESS;
+  }
+
+  imscope_return_t register_setting_int32(const char* name, int32_t initial_val,
+                                          imscope_setting_int32_cb_t callback) {
+    std::lock_guard<std::mutex> lock(settings_mutex);
+    for (auto& s : registered_settings) {
+      if (s.name == name) {
+        s.type = SETTING_TYPE_INT32;
+        s.value.ival = initial_val;
+        s.int32_cb = callback;
+        return IMSCOPE_SUCCESS;
+      }
+    }
+    SettingInfo s;
+    s.name = name;
+    s.type = SETTING_TYPE_INT32;
+    s.value.ival = initial_val;
+    s.int32_cb = callback;
+    registered_settings.push_back(s);
+    return IMSCOPE_SUCCESS;
+  }
+
+  imscope_return_t register_setting_float(const char* name, float initial_val,
+                                          imscope_setting_float_cb_t callback) {
+    std::lock_guard<std::mutex> lock(settings_mutex);
+    for (auto& s : registered_settings) {
+      if (s.name == name) {
+        s.type = SETTING_TYPE_FLOAT;
+        s.value.fval = initial_val;
+        s.float_cb = callback;
+        return IMSCOPE_SUCCESS;
+      }
+    }
+    SettingInfo s;
+    s.name = name;
+    s.type = SETTING_TYPE_FLOAT;
+    s.value.fval = initial_val;
+    s.float_cb = callback;
+    registered_settings.push_back(s);
+    return IMSCOPE_SUCCESS;
+  }
+
   ImscopeProducer() {}
 
   ~ImscopeProducer() {
     stop_flush_thread();
     announce_handler.reset();
+    settings_handler.reset();
     if (nng_socket_id(announce_socket) > 0) {
       nng_close(announce_socket);
+    }
+    if (nng_socket_id(control_socket) > 0) {
+      nng_close(control_socket);
     }
     workers.clear();
     if (nng_socket_id(data_socket) > 0) {
@@ -364,6 +577,7 @@ class ImscopeProducer {
     this->data_address = data_address;
     this->announce_address = announce_address;
     this->name = name;
+    this->control_address = derive_control_address(announce_address);
 
     // Clear previous state if any
     workers.clear();
@@ -378,6 +592,9 @@ class ImscopeProducer {
     }
     if (nng_socket_id(announce_socket) > 0) {
       nng_close(announce_socket);
+    }
+    if (nng_socket_id(control_socket) > 0) {
+      nng_close(control_socket);
     }
 
     this->data_socket = create_nng_rep_socket(data_address);
@@ -398,6 +615,17 @@ class ImscopeProducer {
 
     announce_handler =
         std::make_unique<AnnounceCtx>(this->announce_socket, this);
+
+    nng_rep0_open(&control_socket);
+    rv = nng_listen(control_socket, control_address.c_str(), NULL, 0);
+    if (rv != 0) {
+      spdlog::error(
+          "ImscopeProducer: Failed to listen on control address {}: {}",
+          control_address, nng_strerror(rv));
+    } else {
+      settings_handler =
+          std::make_unique<SettingsCtx>(this->control_socket, this);
+    }
 
     start_flush_thread();
   }
@@ -739,4 +967,29 @@ extern "C" imscope_return_t imscope_try_send_float_by_group(float val,
   int id = instance->get_or_register_scope(name, SCOPE_TYPE_FLOAT, group);
   uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
   return instance->push_scalar_value(val_u, id);
+}
+
+extern "C" imscope_return_t imscope_register_setting_bool(
+    const char* name, bool initial_val, imscope_setting_bool_cb_t callback) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  return instance->register_setting_bool(name, initial_val, callback);
+}
+
+extern "C" imscope_return_t imscope_register_setting_int32(
+    const char* name, int32_t initial_val,
+    imscope_setting_int32_cb_t callback) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  return instance->register_setting_int32(name, initial_val, callback);
+}
+
+extern "C" imscope_return_t imscope_register_setting_float(
+    const char* name, float initial_val, imscope_setting_float_cb_t callback) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  return instance->register_setting_float(name, initial_val, callback);
 }

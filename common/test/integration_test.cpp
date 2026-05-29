@@ -6,6 +6,8 @@
  */
 
 #include <gtest/gtest.h>
+#include <nng/nng.h>
+#include <nng/protocol/reqrep0/req.h>
 #include <spdlog/spdlog.h>
 #include <chrono>
 #include <thread>
@@ -399,5 +401,142 @@ TEST(IntegrationTest, ScalarPublishing) {
   }
 
   delete consumer;
+  imscope_cleanup_producer();
+}
+
+static bool bool_cb_called = false;
+static bool bool_cb_val = false;
+
+void test_bool_cb(bool val) {
+  bool_cb_called = true;
+  bool_cb_val = val;
+}
+
+static bool int32_cb_called = false;
+static int32_t int32_cb_val = 0;
+
+void test_int32_cb(int32_t val) {
+  int32_cb_called = true;
+  int32_cb_val = val;
+}
+
+static bool float_cb_called = false;
+static float float_cb_val = 0.0f;
+
+void test_float_cb(float val) {
+  float_cb_called = true;
+  float_cb_val = val;
+}
+
+TEST(IntegrationTest, SettingsManagement) {
+  const char* data_addr = "inproc://data_settings";
+  const char* announce_addr = "inproc://announce_settings";
+  const char* control_addr = "inproc://announce_settings-control";
+
+  imscope_return_t rv = imscope_init_producer(data_addr, announce_addr,
+                                              "SettingsProducer", nullptr, 0);
+  ASSERT_EQ(rv, IMSCOPE_SUCCESS);
+
+  // Register settings after initialization
+  imscope_register_setting_bool("bool_setting", true, test_bool_cb);
+  imscope_register_setting_int32("int_setting", 42, test_int32_cb);
+  imscope_register_setting_float("float_setting", 3.14f, test_float_cb);
+
+  // Connect control client
+  nng_socket ctrl_sock;
+  nng_req0_open(&ctrl_sock);
+  int nng_res = nng_dial(ctrl_sock, control_addr, NULL, 0);
+  ASSERT_EQ(nng_res, 0);
+
+  // 1. Send GET_ALL request
+  setting_request_t req = {};
+  req.magic = SETTING_REQ_GET_ALL;
+  nng_msg* req_msg;
+  nng_msg_alloc(&req_msg, sizeof(setting_request_t));
+  memcpy(nng_msg_body(req_msg), &req, sizeof(setting_request_t));
+
+  nng_res = nng_sendmsg(ctrl_sock, req_msg, 0);
+  ASSERT_EQ(nng_res, 0);
+
+  nng_msg* rep_msg;
+  nng_res = nng_recvmsg(ctrl_sock, &rep_msg, 0);
+  ASSERT_EQ(nng_res, 0);
+
+  setting_response_t* rep = (setting_response_t*)nng_msg_body(rep_msg);
+  EXPECT_EQ(rep->magic, SETTING_REP_GET_ALL);
+  EXPECT_EQ(rep->status, 0);
+  EXPECT_EQ(rep->num_settings, 3);
+
+  // Check details
+  bool found_bool = false, found_int = false, found_float = false;
+  for (int i = 0; i < rep->num_settings; ++i) {
+    if (strcmp(rep->settings[i].name, "bool_setting") == 0) {
+      found_bool = true;
+      EXPECT_EQ(rep->settings[i].type, SETTING_TYPE_BOOL);
+      EXPECT_EQ(rep->settings[i].value.bval, 1);
+    } else if (strcmp(rep->settings[i].name, "int_setting") == 0) {
+      found_int = true;
+      EXPECT_EQ(rep->settings[i].type, SETTING_TYPE_INT32);
+      EXPECT_EQ(rep->settings[i].value.ival, 42);
+    } else if (strcmp(rep->settings[i].name, "float_setting") == 0) {
+      found_float = true;
+      EXPECT_EQ(rep->settings[i].type, SETTING_TYPE_FLOAT);
+      EXPECT_NEAR(rep->settings[i].value.fval, 3.14f, 1e-5f);
+    }
+  }
+  EXPECT_TRUE(found_bool);
+  EXPECT_TRUE(found_int);
+  EXPECT_TRUE(found_float);
+  nng_msg_free(rep_msg);
+
+  // 2. Send SET request for bool_setting
+  setting_request_t set_req = {};
+  set_req.magic = SETTING_REQ_SET;
+  strcpy(set_req.name, "bool_setting");
+  set_req.type = SETTING_TYPE_BOOL;
+  set_req.value.bval = 0;  // false
+
+  nng_msg_alloc(&req_msg, sizeof(setting_request_t));
+  memcpy(nng_msg_body(req_msg), &set_req, sizeof(setting_request_t));
+  nng_res = nng_sendmsg(ctrl_sock, req_msg, 0);
+  ASSERT_EQ(nng_res, 0);
+
+  nng_res = nng_recvmsg(ctrl_sock, &rep_msg, 0);
+  ASSERT_EQ(nng_res, 0);
+
+  rep = (setting_response_t*)nng_msg_body(rep_msg);
+  EXPECT_EQ(rep->magic, SETTING_REP_SET);
+  EXPECT_EQ(rep->status, 0);
+  nng_msg_free(rep_msg);
+
+  // Check callback
+  EXPECT_TRUE(bool_cb_called);
+  EXPECT_FALSE(bool_cb_val);
+
+  // 3. Send SET request for int_setting
+  memset(&set_req, 0, sizeof(set_req));
+  set_req.magic = SETTING_REQ_SET;
+  strcpy(set_req.name, "int_setting");
+  set_req.type = SETTING_TYPE_INT32;
+  set_req.value.ival = 100;
+
+  nng_msg_alloc(&req_msg, sizeof(setting_request_t));
+  memcpy(nng_msg_body(req_msg), &set_req, sizeof(setting_request_t));
+  nng_res = nng_sendmsg(ctrl_sock, req_msg, 0);
+  ASSERT_EQ(nng_res, 0);
+
+  nng_res = nng_recvmsg(ctrl_sock, &rep_msg, 0);
+  ASSERT_EQ(nng_res, 0);
+
+  rep = (setting_response_t*)nng_msg_body(rep_msg);
+  EXPECT_EQ(rep->magic, SETTING_REP_SET);
+  EXPECT_EQ(rep->status, 0);
+  nng_msg_free(rep_msg);
+
+  // Check callback
+  EXPECT_TRUE(int32_cb_called);
+  EXPECT_EQ(int32_cb_val, 100);
+
+  nng_close(ctrl_sock);
   imscope_cleanup_producer();
 }

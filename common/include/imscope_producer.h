@@ -134,6 +134,17 @@ imscope_return_t imscope_try_send_int32_by_group(int32_t val, const char* name,
 imscope_return_t imscope_try_send_float_by_group(float val, const char* name,
                                                  const char* group);
 
+typedef void (*imscope_setting_bool_cb_t)(bool val);
+typedef void (*imscope_setting_int32_cb_t)(int32_t val);
+typedef void (*imscope_setting_float_cb_t)(float val);
+
+imscope_return_t imscope_register_setting_bool(
+    const char* name, bool initial_val, imscope_setting_bool_cb_t callback);
+imscope_return_t imscope_register_setting_int32(
+    const char* name, int32_t initial_val, imscope_setting_int32_cb_t callback);
+imscope_return_t imscope_register_setting_float(
+    const char* name, float initial_val, imscope_setting_float_cb_t callback);
+
 #ifdef __cplusplus
 }
 #endif

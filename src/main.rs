@@ -48,6 +48,7 @@ enum AppTab {
     Rms = 1,
     Waveform = 2,
     Histogram = 3,
+    Settings = 4,
 }
 
 impl AppTab {
@@ -56,16 +57,18 @@ impl AppTab {
             AppTab::Scatter => AppTab::Rms,
             AppTab::Rms => AppTab::Waveform,
             AppTab::Waveform => AppTab::Histogram,
-            AppTab::Histogram => AppTab::Scatter,
+            AppTab::Histogram => AppTab::Settings,
+            AppTab::Settings => AppTab::Scatter,
         }
     }
 
     fn prev(&self) -> Self {
         match self {
-            AppTab::Scatter => AppTab::Histogram,
+            AppTab::Scatter => AppTab::Settings,
             AppTab::Rms => AppTab::Scatter,
             AppTab::Waveform => AppTab::Rms,
             AppTab::Histogram => AppTab::Waveform,
+            AppTab::Settings => AppTab::Histogram,
         }
     }
 
@@ -91,6 +94,7 @@ struct PlotPane {
     selected_scope_idx: usize,
     scope_list_state: ListState,
     active_tab: AppTab,
+    last_active_plot_tab: AppTab,
     stacking_enabled: bool,
     stacking_size: usize,
     filter_enabled: bool,
@@ -110,6 +114,7 @@ impl PlotPane {
             selected_scope_idx: 0,
             scope_list_state: ListState::default(),
             active_tab: AppTab::Waveform,
+            last_active_plot_tab: AppTab::Waveform,
             stacking_enabled: false,
             stacking_size: 16000,
             filter_enabled: false,
@@ -143,6 +148,12 @@ struct AppState {
 
     status_message: String,
     status_msg_time: Option<Instant>,
+
+    settings: Vec<consumer::SettingInfo>,
+    pending_settings: HashSet<String>,
+    editing_setting_idx: Option<usize>,
+    editing_setting_value: String,
+    selected_setting_idx: usize,
 }
 
 impl AppState {
@@ -161,6 +172,11 @@ impl AppState {
             status_message: "Press 'i' or 'e' to edit Connection URL, then 'Enter' to Connect"
                 .to_string(),
             status_msg_time: Some(Instant::now()),
+            settings: Vec::new(),
+            pending_settings: HashSet::new(),
+            editing_setting_idx: None,
+            editing_setting_value: String::new(),
+            selected_setting_idx: 0,
         }
     }
 }
@@ -356,6 +372,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     app_state.status_msg_time = Some(Instant::now());
                 }
+                WorkerEvent::SettingsRefreshed { settings } => {
+                    app_state.settings = settings;
+                }
+                WorkerEvent::SettingUpdated { name, status } => {
+                    app_state.pending_settings.remove(&name);
+                    if status == 0 {
+                        app_state.status_message = format!("Setting '{}' updated!", name);
+                    } else {
+                        app_state.status_message =
+                            format!("Setting '{}' update failed ({})", name, status);
+                    }
+                    app_state.status_msg_time = Some(Instant::now());
+                    let _ = cmd_tx.send(WorkerCommand::GetSettings);
+                }
             }
         }
 
@@ -395,6 +425,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 KeyCode::Char(c) => {
                                     app_state.announce_url.push(c);
+                                }
+                                _ => {}
+                            }
+                        } else if let Some(idx) = app_state.editing_setting_idx {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    if idx < app_state.settings.len() {
+                                        let name = app_state.settings[idx].name.clone();
+                                        let stype = app_state.settings[idx].setting_type;
+                                        let parsed_val = match stype {
+                                            consumer::SettingType::Int32 => {
+                                                if let Ok(val) = app_state
+                                                    .editing_setting_value
+                                                    .trim()
+                                                    .parse::<i32>()
+                                                {
+                                                    Some(consumer::SettingValue::Int32(val))
+                                                } else {
+                                                    app_state.status_message =
+                                                        "Invalid Int32 value!".to_string();
+                                                    app_state.status_msg_time =
+                                                        Some(Instant::now());
+                                                    None
+                                                }
+                                            }
+                                            consumer::SettingType::Float => {
+                                                if let Ok(val) = app_state
+                                                    .editing_setting_value
+                                                    .trim()
+                                                    .parse::<f32>()
+                                                {
+                                                    Some(consumer::SettingValue::Float(val))
+                                                } else {
+                                                    app_state.status_message =
+                                                        "Invalid Float value!".to_string();
+                                                    app_state.status_msg_time =
+                                                        Some(Instant::now());
+                                                    None
+                                                }
+                                            }
+                                            _ => None,
+                                        };
+                                        if let Some(val) = parsed_val {
+                                            app_state.pending_settings.insert(name.clone());
+                                            let _ = cmd_tx.send(
+                                                consumer::WorkerCommand::UpdateSetting {
+                                                    name,
+                                                    setting_type: stype,
+                                                    value: val,
+                                                },
+                                            );
+                                            app_state.editing_setting_idx = None;
+                                        }
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    app_state.editing_setting_idx = None;
+                                }
+                                KeyCode::Backspace => {
+                                    app_state.editing_setting_value.pop();
+                                }
+                                KeyCode::Char(c) => {
+                                    app_state.editing_setting_value.push(c);
                                 }
                                 _ => {}
                             }
@@ -461,66 +554,144 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 // ── Tab navigation (active pane) ─────────────
                                 KeyCode::Tab => {
+                                    let old_tab = app_state.panes[ap].active_tab;
+                                    if old_tab != AppTab::Settings {
+                                        app_state.panes[ap].last_active_plot_tab = old_tab;
+                                    }
                                     app_state.panes[ap].active_tab =
                                         app_state.panes[ap].active_tab.next();
+                                    if app_state.panes[ap].active_tab == AppTab::Settings {
+                                        let _ = cmd_tx.send(consumer::WorkerCommand::GetSettings);
+                                    }
                                 }
                                 KeyCode::BackTab => {
+                                    let old_tab = app_state.panes[ap].active_tab;
+                                    if old_tab != AppTab::Settings {
+                                        app_state.panes[ap].last_active_plot_tab = old_tab;
+                                    }
                                     app_state.panes[ap].active_tab =
                                         app_state.panes[ap].active_tab.prev();
+                                    if app_state.panes[ap].active_tab == AppTab::Settings {
+                                        let _ = cmd_tx.send(consumer::WorkerCommand::GetSettings);
+                                    }
                                 }
                                 KeyCode::Char('1') => {
                                     app_state.panes[ap].active_tab = AppTab::Scatter;
+                                    app_state.panes[ap].last_active_plot_tab = AppTab::Scatter;
                                 }
                                 KeyCode::Char('2') => {
                                     app_state.panes[ap].active_tab = AppTab::Rms;
+                                    app_state.panes[ap].last_active_plot_tab = AppTab::Rms;
                                 }
                                 KeyCode::Char('3') => {
                                     app_state.panes[ap].active_tab = AppTab::Waveform;
+                                    app_state.panes[ap].last_active_plot_tab = AppTab::Waveform;
                                 }
                                 KeyCode::Char('4') => {
                                     app_state.panes[ap].active_tab = AppTab::Histogram;
+                                    app_state.panes[ap].last_active_plot_tab = AppTab::Histogram;
+                                }
+                                KeyCode::Char('5') => {
+                                    let old_tab = app_state.panes[ap].active_tab;
+                                    if old_tab != AppTab::Settings {
+                                        app_state.panes[ap].last_active_plot_tab = old_tab;
+                                    }
+                                    app_state.panes[ap].active_tab = AppTab::Settings;
+                                    let _ = cmd_tx.send(consumer::WorkerCommand::GetSettings);
                                 }
                                 // ── Scope navigation (active pane) ───────────
                                 KeyCode::Up | KeyCode::Char('k') => {
-                                    if let ConnectionState::Connected { ref scopes, .. } =
-                                        app_state.connection
-                                    {
-                                        if !scopes.is_empty() {
-                                            let new_idx = app_state.panes[ap]
-                                                .selected_scope_idx
-                                                .checked_sub(1)
-                                                .unwrap_or(scopes.len() - 1);
-                                            activate_scope(
-                                                scopes,
-                                                new_idx,
-                                                &mut app_state.panes[ap],
-                                            );
-                                            send_merged_scopes(
-                                                &app_state.panes,
-                                                app_state.num_panes,
-                                                &cmd_tx,
-                                            );
+                                    if app_state.panes[ap].active_tab == AppTab::Settings {
+                                        if !app_state.settings.is_empty() {
+                                            let cur = app_state.selected_setting_idx;
+                                            app_state.selected_setting_idx = if cur == 0 {
+                                                app_state.settings.len() - 1
+                                            } else {
+                                                cur - 1
+                                            };
+                                        }
+                                    } else {
+                                        if let ConnectionState::Connected { ref scopes, .. } =
+                                            app_state.connection
+                                        {
+                                            if !scopes.is_empty() {
+                                                let new_idx = app_state.panes[ap]
+                                                    .selected_scope_idx
+                                                    .checked_sub(1)
+                                                    .unwrap_or(scopes.len() - 1);
+                                                activate_scope(
+                                                    scopes,
+                                                    new_idx,
+                                                    &mut app_state.panes[ap],
+                                                );
+                                                send_merged_scopes(
+                                                    &app_state.panes,
+                                                    app_state.num_panes,
+                                                    &cmd_tx,
+                                                );
+                                            }
                                         }
                                     }
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
-                                    if let ConnectionState::Connected { ref scopes, .. } =
-                                        app_state.connection
-                                    {
-                                        if !scopes.is_empty() {
-                                            let new_idx = (app_state.panes[ap].selected_scope_idx
-                                                + 1)
-                                                % scopes.len();
-                                            activate_scope(
-                                                scopes,
-                                                new_idx,
-                                                &mut app_state.panes[ap],
-                                            );
-                                            send_merged_scopes(
-                                                &app_state.panes,
-                                                app_state.num_panes,
-                                                &cmd_tx,
-                                            );
+                                    if app_state.panes[ap].active_tab == AppTab::Settings {
+                                        if !app_state.settings.is_empty() {
+                                            let cur = app_state.selected_setting_idx;
+                                            app_state.selected_setting_idx =
+                                                (cur + 1) % app_state.settings.len();
+                                        }
+                                    } else {
+                                        if let ConnectionState::Connected { ref scopes, .. } =
+                                            app_state.connection
+                                        {
+                                            if !scopes.is_empty() {
+                                                let new_idx =
+                                                    (app_state.panes[ap].selected_scope_idx + 1)
+                                                        % scopes.len();
+                                                activate_scope(
+                                                    scopes,
+                                                    new_idx,
+                                                    &mut app_state.panes[ap],
+                                                );
+                                                send_merged_scopes(
+                                                    &app_state.panes,
+                                                    app_state.num_panes,
+                                                    &cmd_tx,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Enter | KeyCode::Char(' ') => {
+                                    if app_state.panes[ap].active_tab == AppTab::Settings {
+                                        let idx = app_state.selected_setting_idx;
+                                        if idx < app_state.settings.len() {
+                                            let name = app_state.settings[idx].name.clone();
+                                            if !app_state.pending_settings.contains(&name) {
+                                                match &app_state.settings[idx].value {
+                                                    consumer::SettingValue::Bool(b) => {
+                                                        let new_val = !b;
+                                                        app_state
+                                                            .pending_settings
+                                                            .insert(name.clone());
+                                                        let _ = cmd_tx.send(consumer::WorkerCommand::UpdateSetting {
+                                                            name,
+                                                            setting_type: consumer::SettingType::Bool,
+                                                            value: consumer::SettingValue::Bool(new_val),
+                                                        });
+                                                    }
+                                                    consumer::SettingValue::Int32(i) => {
+                                                        app_state.editing_setting_idx = Some(idx);
+                                                        app_state.editing_setting_value =
+                                                            i.to_string();
+                                                    }
+                                                    consumer::SettingValue::Float(f) => {
+                                                        app_state.editing_setting_idx = Some(idx);
+                                                        app_state.editing_setting_value =
+                                                            f.to_string();
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -675,9 +846,10 @@ fn draw_ui(frame: &mut Frame, state: &mut AppState) {
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(3),
+            Constraint::Length(2), // Header
+            Constraint::Min(10),   // Content
+            Constraint::Length(2), // Help (shortcuts)
+            Constraint::Length(1), // Message Log
         ])
         .split(frame.area());
 
@@ -689,7 +861,7 @@ fn draw_ui(frame: &mut Frame, state: &mut AppState) {
         _ => format!(" | Plots: 2  Active: P{}", state.active_pane + 1),
     };
     let title_block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(Color::Cyan));
     let title_paragraph = Paragraph::new(Line::from(vec![
         Span::raw(" 🛠️  ").fg(Color::Cyan),
@@ -707,10 +879,14 @@ fn draw_ui(frame: &mut Frame, state: &mut AppState) {
     .alignment(Alignment::Left);
     frame.render_widget(title_paragraph, main_chunks[0]);
 
-    // Content: sidebar + plot area(s)
+    // Content: sidebar + plot area(s) + settings pane
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(42), Constraint::Min(20)])
+        .constraints([
+            Constraint::Length(42), // Sidebar
+            Constraint::Min(20),    // Plot Area
+            Constraint::Length(48), // Settings Pane
+        ])
         .split(main_chunks[1]);
 
     draw_sidebar(frame, content_chunks[0], state);
@@ -740,9 +916,11 @@ fn draw_ui(frame: &mut Frame, state: &mut AppState) {
         }
     }
 
-    // Status bar
+    draw_settings_pane(frame, content_chunks[2], state);
+
+    // Help bar
     let shortcut_text = "q:Quit i:URL c:Connect R:Refresh a:Auto r:Single s:Stack g:Ungroup f:Filter P:Panes p:Switch";
-    let status_paragraph = Paragraph::new(Line::from(vec![
+    let help_paragraph = Paragraph::new(Line::from(vec![
         Span::styled(
             " [KEYS] ",
             Style::default()
@@ -751,18 +929,30 @@ fn draw_ui(frame: &mut Frame, state: &mut AppState) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(" {} ", shortcut_text)),
-        Span::raw(" | ").fg(Color::DarkGray),
-        Span::styled(
-            format!("Msg: {}", state.status_message),
-            Style::default().fg(Color::Yellow),
-        ),
     ]))
     .block(
         Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::TOP)
             .border_style(Style::default().fg(Color::DarkGray)),
     );
-    frame.render_widget(status_paragraph, main_chunks[2]);
+    frame.render_widget(help_paragraph, main_chunks[2]);
+
+    // Message Log bar
+    let log_paragraph = Paragraph::new(Line::from(vec![
+        Span::styled(
+            " [LOG] ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {}", state.status_message),
+            Style::default().fg(Color::Yellow),
+        ),
+    ]))
+    .block(Block::default().borders(Borders::NONE));
+    frame.render_widget(log_paragraph, main_chunks[3]);
 }
 
 fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
@@ -966,22 +1156,51 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Span::styled(" [ ] DISABLED", Style::default().fg(Color::DarkGray))
     };
 
-    let mut settings_lines = vec![
-        Line::from(vec![
+    let mut settings_lines = Vec::new();
+
+    if pane.active_tab == AppTab::Settings {
+        settings_lines.push(Line::from(vec![Span::styled(
+            "Dynamic Settings Controls:",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]));
+        settings_lines.push(Line::from(vec![
+            Span::raw("  ▲/▼ or j/k : "),
+            Span::styled("Select setting", Style::default().fg(Color::Cyan)),
+        ]));
+        settings_lines.push(Line::from(vec![
+            Span::raw("  Enter/Space: "),
+            Span::styled("Toggle / Edit value", Style::default().fg(Color::Cyan)),
+        ]));
+        settings_lines.push(Line::from(vec![
+            Span::raw("  Esc        : "),
+            Span::styled("Cancel edit", Style::default().fg(Color::Cyan)),
+        ]));
+        settings_lines.push(Line::from(Span::raw("")));
+        settings_lines.push(Line::from(vec![
             Span::styled(
                 "Auto Collect ('a'):",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             auto_status,
-        ]),
-        Line::from(vec![
+        ]));
+    } else {
+        settings_lines.push(Line::from(vec![
+            Span::styled(
+                "Auto Collect ('a'):",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            auto_status,
+        ]));
+        settings_lines.push(Line::from(vec![
             Span::styled(
                 "Stacking ('s'):    ",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             stacking_status,
-        ]),
-        Line::from(vec![
+        ]));
+        settings_lines.push(Line::from(vec![
             Span::raw("Stacking size: "),
             Span::styled(
                 format!("{:>5}", pane.stacking_size),
@@ -991,8 +1210,8 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
             Span::styled(" [-] ", Style::default().fg(Color::White).bg(Color::Red)),
             Span::raw(" "),
             Span::styled(" [+] ", Style::default().fg(Color::White).bg(Color::Green)),
-        ]),
-        Line::from(vec![
+        ]));
+        settings_lines.push(Line::from(vec![
             Span::styled(
                 "Ungroup ('g'):     ",
                 Style::default().add_modifier(Modifier::BOLD),
@@ -1007,16 +1226,16 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
             } else {
                 Span::styled(" [ ] GROUPED", Style::default().fg(Color::DarkGray))
             },
-        ]),
-        Line::from(Span::raw("")),
-        Line::from(vec![
+        ]));
+        settings_lines.push(Line::from(Span::raw("")));
+        settings_lines.push(Line::from(vec![
             Span::styled(
                 "Noise Filter ('f'):",
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             filter_status,
-        ]),
-        Line::from(vec![
+        ]));
+        settings_lines.push(Line::from(vec![
             Span::raw("Cutoff linear: "),
             Span::styled(
                 format!("{:>5.0}", pane.filter_cutoff),
@@ -1026,8 +1245,8 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
             Span::styled(" [-] ", Style::default().fg(Color::White).bg(Color::Red)),
             Span::raw(" "),
             Span::styled(" [+] ", Style::default().fg(Color::White).bg(Color::Green)),
-        ]),
-        Line::from(vec![
+        ]));
+        settings_lines.push(Line::from(vec![
             Span::raw("Max noise %:   "),
             Span::styled(
                 format!("{:>4.0}%", pane.filter_percentage),
@@ -1037,44 +1256,44 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
             Span::styled(" [-] ", Style::default().fg(Color::White).bg(Color::Red)),
             Span::raw(" "),
             Span::styled(" [+] ", Style::default().fg(Color::White).bg(Color::Green)),
-        ]),
-        Line::from(Span::raw("")),
-        Line::from(vec![Span::styled(
+        ]));
+        settings_lines.push(Line::from(Span::raw("")));
+        settings_lines.push(Line::from(vec![Span::styled(
             "Active Scope Info:",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::UNDERLINED),
-        )]),
-        Line::from(vec![
+        )]));
+        settings_lines.push(Line::from(vec![
             Span::raw("Name: "),
             Span::styled(active_scope_name, Style::default().fg(Color::Green)),
-        ]),
-        Line::from(vec![
+        ]));
+        settings_lines.push(Line::from(vec![
             Span::raw("Type: "),
             Span::styled(
                 format!("{:?}", active_scope_type),
                 Style::default().fg(Color::Green),
             ),
-        ]),
-    ];
+        ]));
 
-    if let Some(ref snapshot) = pane.active_snapshot {
-        settings_lines.push(Line::from(vec![
-            Span::raw("BufferSize: "),
-            Span::styled(
-                format!("{}", snapshot.size()),
-                Style::default().fg(Color::Green),
-            ),
-        ]));
-    } else if pane.in_group_mode && !pane.group_snapshots.is_empty() {
-        let total: usize = pane.group_snapshots.values().map(|s| s.size()).sum();
-        settings_lines.push(Line::from(vec![
-            Span::raw("BufferSize: "),
-            Span::styled(
-                format!("{} (group)", total),
-                Style::default().fg(Color::Cyan),
-            ),
-        ]));
+        if let Some(ref snapshot) = pane.active_snapshot {
+            settings_lines.push(Line::from(vec![
+                Span::raw("BufferSize: "),
+                Span::styled(
+                    format!("{}", snapshot.size()),
+                    Style::default().fg(Color::Green),
+                ),
+            ]));
+        } else if pane.in_group_mode && !pane.group_snapshots.is_empty() {
+            let total: usize = pane.group_snapshots.values().map(|s| s.size()).sum();
+            settings_lines.push(Line::from(vec![
+                Span::raw("BufferSize: "),
+                Span::styled(
+                    format!("{} (group)", total),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+        }
     }
 
     let settings_block = Block::default()
@@ -1086,6 +1305,152 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         Paragraph::new(settings_lines).block(settings_block),
         chunks[2],
     );
+}
+
+fn draw_settings_pane(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    let ap = state.active_pane;
+    let is_settings_focused = state.num_panes > 0 && state.panes[ap].active_tab == AppTab::Settings;
+    let border_color = if is_settings_focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Settings [5] ")
+        .border_style(Style::default().fg(border_color));
+
+    if state.settings.is_empty() {
+        let msg = Paragraph::new(
+            "\n\nNo dynamic settings\nregistered by producer.\n\nOr producer is not connected.",
+        )
+        .alignment(Alignment::Center)
+        .fg(Color::DarkGray)
+        .block(block);
+        frame.render_widget(msg, area);
+        return;
+    }
+
+    // Split the settings pane area vertically to have the table and a footer
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(5)])
+        .split(area);
+
+    let mut rows = Vec::new();
+    for (idx, setting) in state.settings.iter().enumerate() {
+        let is_selected = is_settings_focused && idx == state.selected_setting_idx;
+        let is_pending = state.pending_settings.contains(&setting.name);
+        let is_editing = is_settings_focused && state.editing_setting_idx == Some(idx);
+
+        let selector = if is_selected { "➔ " } else { "  " };
+
+        let row_style = if is_pending {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC)
+        } else if is_selected {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        let name_cell = ratatui::widgets::Cell::from(setting.name.as_str());
+        let type_cell = ratatui::widgets::Cell::from(match setting.setting_type {
+            consumer::SettingType::Bool => "Bool",
+            consumer::SettingType::Int32 => "Int32",
+            consumer::SettingType::Float => "Float",
+        });
+
+        let val_str = if is_editing {
+            format!("✍  {}█", state.editing_setting_value)
+        } else if is_pending {
+            match &setting.value {
+                consumer::SettingValue::Bool(b) => format!("Updating to {}...", !b),
+                _ => "Updating...".to_string(),
+            }
+        } else {
+            match &setting.value {
+                consumer::SettingValue::Bool(b) => b.to_string(),
+                consumer::SettingValue::Int32(i) => i.to_string(),
+                consumer::SettingValue::Float(f) => format!("{:.4}", f),
+            }
+        };
+
+        let val_cell = ratatui::widgets::Cell::from(val_str);
+
+        rows.push(
+            ratatui::widgets::Row::new(vec![
+                ratatui::widgets::Cell::from(selector),
+                name_cell,
+                type_cell,
+                val_cell,
+            ])
+            .style(row_style),
+        );
+    }
+
+    let table = ratatui::widgets::Table::new(
+        rows,
+        [
+            Constraint::Length(3),
+            Constraint::Percentage(40),
+            Constraint::Percentage(20),
+            Constraint::Percentage(40),
+        ],
+    )
+    .header(
+        ratatui::widgets::Row::new(vec![
+            ratatui::widgets::Cell::from(""),
+            ratatui::widgets::Cell::from("Setting Name"),
+            ratatui::widgets::Cell::from("Type"),
+            ratatui::widgets::Cell::from("Value / Input"),
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .block(block);
+
+    frame.render_widget(table, chunks[0]);
+
+    // Render helper/metadata for settings in the footer
+    let meta_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Settings Help & Status ")
+        .border_style(Style::default().fg(border_color));
+
+    let meta_lines = vec![
+        Line::from(vec![
+            Span::raw("Keys: "),
+            Span::styled("▲/▼", Style::default().fg(Color::Cyan)),
+            Span::raw(" Select  "),
+            Span::styled("Enter/Space", Style::default().fg(Color::Cyan)),
+            Span::raw(" Edit/Toggle"),
+        ]),
+        Line::from(vec![
+            Span::raw("Status: "),
+            if state.pending_settings.is_empty() {
+                Span::styled("All updates confirmed.", Style::default().fg(Color::Green))
+            } else {
+                Span::styled(
+                    format!(
+                        "Awaiting {} confirmation(s)...",
+                        state.pending_settings.len()
+                    ),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::ITALIC),
+                )
+            },
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(meta_lines).block(meta_block), chunks[1]);
 }
 
 fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx: usize) {
@@ -1117,6 +1482,7 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
         "2. RMS Power (IQ only)",
         "3. Waveform",
         "4. Histogram",
+        "5. Settings",
     ];
     let tab_style = Style::default().fg(Color::White);
     let selected_style = Style::default()
@@ -1142,6 +1508,11 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
         .border_style(Style::default().fg(border_color));
 
     let pane = &state.panes[pane_idx];
+    let display_tab = if pane.active_tab == AppTab::Settings {
+        pane.last_active_plot_tab
+    } else {
+        pane.active_tab
+    };
 
     if pane.in_group_mode {
         // ── Group mode ──────────────────────────────────────────────────────────
@@ -1163,7 +1534,7 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
             }
         }
 
-        match pane.active_tab {
+        match display_tab {
             AppTab::Scatter | AppTab::Rms => {
                 let msg = Paragraph::new(
                     "\n\nScatter and RMS Power plots are not available for grouped scopes.",
@@ -1280,6 +1651,7 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
                     frame.render_widget(chart, chunks[1]);
                 }
             }
+            AppTab::Settings => unreachable!(),
         }
     } else if let Some(ref snapshot) = pane.active_snapshot {
         if snapshot.size() == 0 {
@@ -1291,7 +1663,7 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
             .block(plot_block);
             frame.render_widget(msg, chunks[1]);
         } else {
-            match pane.active_tab {
+            match display_tab {
                 AppTab::Scatter => {
                     if let ConnectionState::Connected { ref scopes, .. } = state.connection {
                         if scopes[pane.selected_scope_idx].scope_type != ScopeType::IqData {
@@ -1487,6 +1859,7 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
                         .label_style(Style::default().fg(Color::Gray));
                     frame.render_widget(chart, chunks[1]);
                 }
+                AppTab::Settings => unreachable!(),
             }
         }
     } else {
@@ -1634,15 +2007,20 @@ fn handle_mouse_click(
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(3),
+            Constraint::Length(2), // Header
+            Constraint::Min(10),   // Content
+            Constraint::Length(2), // Help
+            Constraint::Length(1), // Log
         ])
         .split(area);
 
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(42), Constraint::Min(20)])
+        .constraints([
+            Constraint::Length(42), // Sidebar
+            Constraint::Min(20),    // Plot Area
+            Constraint::Length(48), // Settings Pane
+        ])
         .split(main_chunks[1]);
 
     let sidebar_chunks = Layout::default()
@@ -1800,16 +2178,37 @@ fn handle_mouse_click(
     {
         let relative_col = col as i32 - tab_bar.x as i32 - 1;
         if relative_col >= 0 {
-            state.panes[ap].active_tab = if relative_col < 17 {
+            let next_tab = if relative_col < 20 {
                 AppTab::Scatter
-            } else if relative_col < 37 {
+            } else if relative_col < 42 {
                 AppTab::Rms
-            } else if relative_col < 51 {
+            } else if relative_col < 54 {
                 AppTab::Waveform
-            } else {
+            } else if relative_col < 67 {
                 AppTab::Histogram
+            } else {
+                AppTab::Settings
             };
+            if next_tab != AppTab::Settings {
+                state.panes[ap].last_active_plot_tab = next_tab;
+            }
+            state.panes[ap].active_tab = next_tab;
+            if next_tab == AppTab::Settings {
+                let _ = cmd_tx.send(WorkerCommand::GetSettings);
+            }
         }
+        return;
+    }
+
+    // 5. Settings pane click (focus settings)
+    let settings_rect = content_chunks[2];
+    if col >= settings_rect.x
+        && col < settings_rect.x + settings_rect.width
+        && row >= settings_rect.y
+        && row < settings_rect.y + settings_rect.height
+    {
+        state.panes[ap].active_tab = AppTab::Settings;
+        let _ = cmd_tx.send(WorkerCommand::GetSettings);
     }
 }
 
@@ -1823,11 +2222,11 @@ mod tests {
     fn test_handle_mouse_click_tabs() {
         let mut state = AppState::new("tcp://127.0.0.1:5557".to_string());
         let (tx, _rx) = mpsc::channel();
-        let area = Rect::new(0, 0, 120, 24);
+        let area = Rect::new(0, 0, 180, 24);
 
-        // tab_bar: x=42, y=3, width=78, height=3
-        // Waveform starts at relative_col=38, so col=42+1+38=81, row=3+1=4
-        handle_mouse_click(81, 4, area, &mut state, &tx);
+        // tab_bar: x=42, y=2, width=90, height=3
+        // Waveform is relative_col=45, so col=42+1+45=88, row=2+1=3
+        handle_mouse_click(88, 3, area, &mut state, &tx);
         assert_eq!(state.panes[0].active_tab, AppTab::Waveform);
     }
 
@@ -1837,7 +2236,10 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let area = Rect::new(0, 0, 120, 35);
 
-        handle_mouse_click(5, 7, area, &mut state, &tx);
+        // Header height is 2, so Content starts at y=2.
+        // Sidebar connection block conn is y=2, height=6.
+        // Refresh scopes is at conn.y + 4 = 6.
+        handle_mouse_click(5, 6, area, &mut state, &tx);
 
         let cmd = rx.try_recv().unwrap();
         match cmd {
