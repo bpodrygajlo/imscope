@@ -1,10 +1,25 @@
 [package]
-name = "imscope-tui"
+name = "imscope"
 version = "0.1.0"
 edition = "2024"
+
+[lib]
+name = "imscope"
+path = "src/lib.rs"
+
+[[bin]]
+name = "imscope-tui"
+path = "src/bin/tui.rs"
+
+[[bin]]
+name = "imscope-gui"
+path = "src/bin/gui.rs"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
 nng = "1.0.1"
 ratatui = "0.30.0"
+dear-imgui-rs = "0.14.0"
+dear-implot = "0.14.0"
+dear-app = { version = "0.14.0", features = ["implot"] }

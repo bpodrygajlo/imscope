@@ -7,8 +7,6 @@
 
 #![allow(dead_code)]
 
-mod consumer;
-
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::mpsc;
@@ -33,7 +31,9 @@ use ratatui::{
     },
 };
 
-use crate::consumer::{IQSnapshot, ScopeConfig, ScopeType, WorkerCommand, WorkerEvent, run_worker};
+use imscope::consumer::{
+    self, IQSnapshot, ScopeConfig, ScopeType, WorkerCommand, WorkerEvent, run_worker,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "TUI client for imscope using Ratatui")]
