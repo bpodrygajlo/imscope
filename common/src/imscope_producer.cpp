@@ -15,12 +15,12 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "imscope_producer.h"
@@ -311,7 +311,7 @@ class ImscopeProducer {
   std::vector<std::unique_ptr<ScopeCtx>> workers;
   std::unique_ptr<AnnounceCtx> announce_handler;
   std::unique_ptr<SettingsCtx> settings_handler;
-  std::map<int, ScopeCtx*> active_requests;
+  std::unordered_map<int, ScopeCtx*> active_requests;
   std::mutex active_requests_mutex;
   std::mutex scopes_mutex;
   std::mutex acquired_msgs_mutex;
@@ -332,7 +332,7 @@ class ImscopeProducer {
     ScalarAccumulator() { last_send_time = std::chrono::steady_clock::now(); }
   };
 
-  std::map<int, ScalarAccumulator> scalar_accumulators;
+  std::unordered_map<int, ScalarAccumulator> scalar_accumulators;
 
  public:
   imscope_return_t push_scalar_value(uint32_t val, int id) {
@@ -724,7 +724,7 @@ class ImscopeProducer {
     return IMSCOPE_SUCCESS;
   }
 
-  std::map<int, nng_msg*> acquired_msgs;
+  std::unordered_map<int, nng_msg*> acquired_msgs;
 
   void* acquire_buffer(int id, size_t num_samples) {
     ScopeCtx* worker = nullptr;
