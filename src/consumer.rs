@@ -154,14 +154,14 @@ impl IQSnapshot {
         }
     }
 
-    pub fn read_scope_msg(&mut self, msg: ScopeMessage, collect: bool) {
+    pub fn read_scope_msg(&mut self, msg: &ScopeMessage, collect: bool) {
         self.meta = msg.meta;
         let num_samples = msg.real.len();
         let is_iq = !msg.imag.is_empty();
 
         if !collect {
-            self.real = msg.real;
-            self.imag = msg.imag;
+            self.real.clone_from(&msg.real);
+            self.imag.clone_from(&msg.imag);
             self.preprocess();
         } else {
             let current_size = self.real.len();
@@ -967,5 +967,34 @@ mod tests {
         assert_eq!(res.scopes[0].name, "TestScope");
         assert_eq!(res.scopes[0].group, "");
         assert_eq!(res.scopes[0].scope_type, ScopeType::IqData);
+    }
+}
+
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn benchmark_read_scope_msg() {
+        let mut snap = IQSnapshot::new(1);
+        let msg = ScopeMessage {
+            meta: NRmetadata::default(),
+            time_taken_in_ns: 0,
+            id: 1,
+            data_size: 16000 * 8,
+            real: vec![0.5; 16000],
+            imag: vec![0.5; 16000],
+        };
+
+        let iterations = 10000;
+
+        let start = Instant::now();
+        for _ in 0..iterations {
+            snap.read_scope_msg(&msg, false);
+        }
+        let duration = start.elapsed();
+
+        println!("Baseline duration: {:?}", duration);
     }
 }

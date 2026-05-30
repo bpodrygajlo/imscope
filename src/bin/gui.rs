@@ -224,12 +224,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if id == scope_id {
                                     if pane.in_group_mode {
                                         if let Some(snap) = pane.group_snapshots.get_mut(&scope_id) {
-                                            snap.read_scope_msg(msg.clone(), pane.stacking_enabled);
+                                            snap.read_scope_msg(&msg, pane.stacking_enabled);
                                             routed = true;
                                         }
                                     } else if let Some(ref mut snapshot) = pane.active_snapshot {
                                         if snapshot.scope_id == scope_id as i32 {
-                                            snapshot.read_scope_msg(msg.clone(), pane.stacking_enabled);
+                                            snapshot.read_scope_msg(&msg, pane.stacking_enabled);
                                             routed = true;
                                         }
                                     }
