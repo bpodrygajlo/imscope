@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -8,8 +8,9 @@ use dear_app::{AddOnsConfig, AppBuilder, Theme};
 use dear_imgui_rs::{Condition, TreeNodeFlags};
 use dear_implot::*;
 
+use imscope::app::{ConnectionState, PlotPane, activate_scope, send_merged_scopes};
 use imscope::consumer::{
-    self, IQSnapshot, ScopeConfig, ScopeType, SettingValue, WorkerCommand, WorkerEvent, run_worker,
+    self as consumer, ScopeType, SettingValue, WorkerCommand, WorkerEvent, run_worker,
 };
 
 #[derive(Parser, Debug)]
@@ -21,99 +22,6 @@ use imscope::consumer::{
 struct Args {
     #[arg(short, long, default_value = "tcp://127.0.0.1:5557")]
     announce_url: String,
-}
-
-enum ConnectionState {
-    Disconnected(Option<String>),
-    Connecting,
-    Connected {
-        name: String,
-        data_address: String,
-        control_address: String,
-        scopes: Vec<consumer::ScopeConfig>,
-    },
-}
-
-struct PlotPane {
-    selected_scope_idx: usize,
-    stacking_enabled: bool,
-    stacking_size: usize,
-    filter_enabled: bool,
-    filter_cutoff: f32,
-    filter_percentage: f32,
-    active_snapshot: Option<IQSnapshot>,
-    group_snapshots: HashMap<usize, IQSnapshot>,
-    in_group_mode: bool,
-    ungrouped: bool,
-    worker_scopes: Vec<(usize, ScopeType)>,
-}
-
-impl PlotPane {
-    fn new() -> Self {
-        Self {
-            selected_scope_idx: 0,
-            stacking_enabled: false,
-            stacking_size: 16000,
-            filter_enabled: false,
-            filter_cutoff: 0.0,
-            filter_percentage: 50.0,
-            active_snapshot: None,
-            group_snapshots: HashMap::new(),
-            in_group_mode: false,
-            ungrouped: false,
-            worker_scopes: Vec::new(),
-        }
-    }
-}
-
-fn activate_scope(scopes: &[ScopeConfig], idx: usize, pane: &mut PlotPane) {
-    if scopes.is_empty() {
-        return;
-    }
-    let idx = idx.min(scopes.len() - 1);
-    let group = &scopes[idx].group;
-    if !group.is_empty() && !pane.ungrouped {
-        let members: Vec<(usize, ScopeType)> = scopes
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| &s.group == group)
-            .map(|(i, s)| (i, s.scope_type))
-            .collect();
-        pane.group_snapshots.clear();
-        for &(id, _) in &members {
-            let mut snap = IQSnapshot::new(id as i32);
-            snap.max_stacked_size = pane.stacking_size;
-            pane.group_snapshots.insert(id, snap);
-        }
-        pane.worker_scopes = members;
-        pane.active_snapshot = None;
-        pane.in_group_mode = true;
-    } else {
-        let mut snap = IQSnapshot::new(idx as i32);
-        snap.max_stacked_size = pane.stacking_size;
-        pane.worker_scopes = vec![(idx, scopes[idx].scope_type)];
-        pane.active_snapshot = Some(snap);
-        pane.group_snapshots.clear();
-        pane.in_group_mode = false;
-    }
-    pane.selected_scope_idx = idx;
-}
-
-fn send_merged_scopes(
-    panes: &[PlotPane; 2],
-    num_panes: usize,
-    cmd_tx: &mpsc::Sender<WorkerCommand>,
-) {
-    let mut all: Vec<(usize, ScopeType)> = Vec::new();
-    let mut seen = HashSet::new();
-    for pane in &panes[..num_panes] {
-        for &(id, stype) in &pane.worker_scopes {
-            if seen.insert(id) {
-                all.push((id, stype));
-            }
-        }
-    }
-    let _ = cmd_tx.send(WorkerCommand::SelectGroup { members: all });
 }
 
 struct AppState {

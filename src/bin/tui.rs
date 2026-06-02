@@ -5,9 +5,7 @@
  * See LICENSE file in the project root for full license information.
  */
 
-#![allow(dead_code)]
-
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io;
 use std::sync::mpsc;
 use std::thread;
@@ -31,8 +29,11 @@ use ratatui::{
     },
 };
 
+use imscope::app::{
+    ConnectionState, HasWorkerScopes, activate_scope as app_activate_scope, send_merged_scopes,
+};
 use imscope::consumer::{
-    self, IQSnapshot, ScopeConfig, ScopeType, WorkerCommand, WorkerEvent, run_worker,
+    self as consumer, ScopeConfig, ScopeType, WorkerCommand, WorkerEvent, run_worker,
 };
 
 #[derive(Parser, Debug)]
@@ -77,54 +78,44 @@ impl AppTab {
     }
 }
 
-enum ConnectionState {
-    Disconnected(Option<String>),
-    Connecting,
-    Connected {
-        name: String,
-        data_address: String,
-        control_address: String,
-        scopes: Vec<consumer::ScopeConfig>,
-    },
-}
-
 // ── Per-plot-pane state ────────────────────────────────────────────────────────
 
+/// TUI wrapper around the shared PlotPane.  Deref/DerefMut give transparent
+/// access to all shared fields (selected_scope_idx, worker_scopes, …) while
+/// keeping the TUI-specific fields (tab state, list state) local.
 struct PlotPane {
-    selected_scope_idx: usize,
+    inner: imscope::app::PlotPane,
     scope_list_state: ListState,
     active_tab: AppTab,
     last_active_plot_tab: AppTab,
-    stacking_enabled: bool,
-    stacking_size: usize,
-    filter_enabled: bool,
-    filter_cutoff: f32,
-    filter_percentage: f32,
-    active_snapshot: Option<IQSnapshot>,
-    group_snapshots: HashMap<usize, IQSnapshot>,
-    in_group_mode: bool,
-    ungrouped: bool,
-    /// Scope IDs (and their types) this pane contributes to the worker's fetch list.
-    worker_scopes: Vec<(usize, ScopeType)>,
+}
+
+impl std::ops::Deref for PlotPane {
+    type Target = imscope::app::PlotPane;
+    fn deref(&self) -> &imscope::app::PlotPane {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for PlotPane {
+    fn deref_mut(&mut self) -> &mut imscope::app::PlotPane {
+        &mut self.inner
+    }
+}
+
+impl HasWorkerScopes for PlotPane {
+    fn worker_scopes(&self) -> &[(usize, ScopeType)] {
+        &self.inner.worker_scopes
+    }
 }
 
 impl PlotPane {
     fn new() -> Self {
         Self {
-            selected_scope_idx: 0,
+            inner: imscope::app::PlotPane::new(),
             scope_list_state: ListState::default(),
             active_tab: AppTab::Waveform,
             last_active_plot_tab: AppTab::Waveform,
-            stacking_enabled: false,
-            stacking_size: 16000,
-            filter_enabled: false,
-            filter_cutoff: 0.0,
-            filter_percentage: 50.0,
-            active_snapshot: None,
-            group_snapshots: HashMap::new(),
-            in_group_mode: false,
-            ungrouped: false,
-            worker_scopes: Vec::new(),
         }
     }
 }
@@ -194,53 +185,11 @@ const GROUP_COLORS: [Color; 8] = [
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-/// Activate scope `idx` for `pane`: updates worker_scopes, snapshots, and group state.
+/// Thin TUI wrapper: calls shared activate_scope then syncs the list widget state.
 fn activate_scope(scopes: &[ScopeConfig], idx: usize, pane: &mut PlotPane) {
-    let group = &scopes[idx].group;
-    if !group.is_empty() && !pane.ungrouped {
-        let members: Vec<(usize, ScopeType)> = scopes
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| &s.group == group)
-            .map(|(i, s)| (i, s.scope_type))
-            .collect();
-        pane.group_snapshots.clear();
-        for &(id, _) in &members {
-            let mut snap = IQSnapshot::new(id as i32);
-            snap.max_stacked_size = pane.stacking_size;
-            pane.group_snapshots.insert(id, snap);
-        }
-        pane.worker_scopes = members;
-        pane.active_snapshot = None;
-        pane.in_group_mode = true;
-    } else {
-        let mut snap = IQSnapshot::new(idx as i32);
-        snap.max_stacked_size = pane.stacking_size;
-        pane.worker_scopes = vec![(idx, scopes[idx].scope_type)];
-        pane.active_snapshot = Some(snap);
-        pane.group_snapshots.clear();
-        pane.in_group_mode = false;
-    }
-    pane.selected_scope_idx = idx;
-    pane.scope_list_state.select(Some(idx));
-}
-
-/// Merge all active panes' worker_scopes (deduped) and tell the worker to collect them.
-fn send_merged_scopes(
-    panes: &[PlotPane; 2],
-    num_panes: usize,
-    cmd_tx: &mpsc::Sender<WorkerCommand>,
-) {
-    let mut all: Vec<(usize, ScopeType)> = Vec::new();
-    let mut seen = HashSet::new();
-    for pane in &panes[..num_panes] {
-        for &(id, stype) in &pane.worker_scopes {
-            if seen.insert(id) {
-                all.push((id, stype));
-            }
-        }
-    }
-    let _ = cmd_tx.send(WorkerCommand::SelectGroup { members: all });
+    app_activate_scope(scopes, idx, &mut pane.inner);
+    pane.scope_list_state
+        .select(Some(pane.inner.selected_scope_idx));
 }
 
 // ── Main ───────────────────────────────────────────────────────────────────────
@@ -314,16 +263,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 WorkerEvent::NewData { scope_id, msg } => {
                     let mut routed = false;
                     'route: for pane in &mut app_state.panes[..app_state.num_panes] {
+                        // Copy scalar before any mutable borrow to satisfy the borrow checker
+                        // across the Deref boundary (group_snapshots / active_snapshot are
+                        // mutably borrowed through the same DerefMut target as stacking_enabled).
+                        let stacking_enabled = pane.stacking_enabled;
                         for &(id, _) in &pane.worker_scopes {
                             if id == scope_id {
                                 if pane.in_group_mode {
                                     if let Some(snap) = pane.group_snapshots.get_mut(&scope_id) {
-                                        snap.read_scope_msg(&msg, pane.stacking_enabled);
+                                        snap.read_scope_msg(&msg, stacking_enabled);
                                         routed = true;
                                     }
                                 } else if let Some(ref mut snapshot) = pane.active_snapshot {
                                     if snapshot.scope_id == scope_id as i32 {
-                                        snapshot.read_scope_msg(&msg, pane.stacking_enabled);
+                                        snapshot.read_scope_msg(&msg, stacking_enabled);
                                         routed = true;
                                     }
                                 }
