@@ -445,9 +445,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             if let Some(snapshot) = &pane.active_snapshot {
                                                 if !snapshot.real.is_empty() {
                                                     let label = format!("Scatter Plot (Scope {})", snapshot.scope_id);
+                                                    let lim = if snapshot.max_iq > 0.0 { snapshot.max_iq * 1.1 } else { 1.0 };
+                                                    plot_ui.set_next_axes_limits(-lim, lim, -lim, lim, PlotCond::Always);
                                                     if let Some(token) = plot_ui.begin_plot_with_size(&label, [-1.0, -1.0]) {
-                                                        let lim = if snapshot.max_iq > 0.0 { snapshot.max_iq * 1.1 } else { 1.0 };
-                                                        plot_ui.set_next_axes_limits(-lim, lim, -lim, lim, PlotCond::Always);
                                                         let _ = plot_ui.scatter_plot("IQ Constellation", &snapshot.real, &snapshot.imag);
                                                         token.end();
                                                     }
