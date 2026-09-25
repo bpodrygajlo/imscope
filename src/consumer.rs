@@ -215,6 +215,17 @@ impl IQSnapshot {
     }
 }
 
+/// Root-mean-square of a power series (`power[i] = r[i]^2 + im[i]^2`),
+/// i.e. sqrt(mean(power)) — the actual RMS power measurement, as opposed to
+/// the raw per-sample instantaneous power values in `IQSnapshot::power`.
+pub fn rms_power(power: &[f32]) -> f32 {
+    if power.is_empty() {
+        return 0.0;
+    }
+    let mean = power.iter().sum::<f32>() / power.len() as f32;
+    mean.sqrt()
+}
+
 pub fn parse_announce_response(bytes: &[u8]) -> Result<AnnounceResponse, String> {
     if bytes.len() < 388 {
         return Err("Message too short for announce header".into());
@@ -1180,6 +1191,25 @@ mod tests {
         r[0..5].fill(0.0);
         let i = vec![0.0f64; 10];
         assert!(check_noise_filter(&r, &i, 1.0, 50.0));
+    }
+
+    #[test]
+    fn test_rms_power_empty_is_zero() {
+        assert_eq!(rms_power(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_rms_power_constant_signal() {
+        // Constant power of 4.0 -> RMS is just sqrt(4.0) = 2.0.
+        assert_eq!(rms_power(&[4.0, 4.0, 4.0, 4.0]), 2.0);
+    }
+
+    #[test]
+    fn test_rms_power_averages_varying_values() {
+        // mean(power) = (0 + 4 + 16)/3 = 20/3 -> sqrt(20/3)
+        let power = [0.0f32, 4.0, 16.0];
+        let expected = (20.0f32 / 3.0).sqrt();
+        assert!((rms_power(&power) - expected).abs() < 1e-6);
     }
 
     // ── build / parse settings ───────────────────────────────────────────────

@@ -24,6 +24,22 @@ struct Args {
     announce_url: String,
 }
 
+// Standard scope Ch1/Ch2-style trace colors, kept consistent across tabs.
+const REAL_COLOR: [f32; 4] = [1.0, 0.75, 0.0, 1.0]; // amber
+const IMAG_COLOR: [f32; 4] = [0.0, 0.85, 1.0, 1.0]; // cyan
+
+fn render_measurements(ui: &dear_imgui_rs::Ui, label: &str, snap: &consumer::IQSnapshot) {
+    ui.text(format!(
+        "{}: Peak={:.1} | Max Pwr={:.1} | RMS Pwr={:.2} | Samples={} | Active={}",
+        label,
+        snap.max_iq,
+        snap.max_power,
+        consumer::rms_power(&snap.power),
+        snap.size(),
+        snap.nonzero_count,
+    ));
+}
+
 struct AppState {
     connection: ConnectionState,
     announce_url: String,
@@ -253,16 +269,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     ui.separator();
 
-                    ui.text("Collection Options");
-                    if ui.checkbox("Auto Collect", &mut app_state.auto_collect_enabled) {
-                        let _ = cmd_tx_clone.send(WorkerCommand::SetAutoCollect(app_state.auto_collect_enabled));
+                    ui.text("Acquisition");
+                    if app_state.auto_collect_enabled {
+                        ui.text_colored([0.2, 0.9, 0.2, 1.0], "\u{25CF} RUN");
+                    } else {
+                        ui.text_colored([0.9, 0.2, 0.2, 1.0], "\u{25A0} STOP");
                     }
-
-                    if !app_state.auto_collect_enabled {
-                        ui.same_line();
-                        if ui.button("Request Frame") {
-                            let _ = cmd_tx_clone.send(WorkerCommand::RequestSingleFrame);
+                    if ui.button("Run") && !app_state.auto_collect_enabled {
+                        app_state.auto_collect_enabled = true;
+                        let _ = cmd_tx_clone.send(WorkerCommand::SetAutoCollect(true));
+                    }
+                    ui.same_line();
+                    if ui.button("Stop") && app_state.auto_collect_enabled {
+                        app_state.auto_collect_enabled = false;
+                        let _ = cmd_tx_clone.send(WorkerCommand::SetAutoCollect(false));
+                    }
+                    ui.same_line();
+                    if ui.button("Single") {
+                        if app_state.auto_collect_enabled {
+                            app_state.auto_collect_enabled = false;
+                            let _ = cmd_tx_clone.send(WorkerCommand::SetAutoCollect(false));
                         }
+                        let _ = cmd_tx_clone.send(WorkerCommand::RequestSingleFrame);
                     }
 
                     // Panes layout option
@@ -435,6 +463,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Determine tabs to render
                             let show_scatter_rms_hist2d = !pane.in_group_mode && (active_scope.scope_type == ScopeType::IqData);
 
+                            // ── Live Measurements Readout ──
+                            if pane.in_group_mode {
+                                for (&member_id, snap) in &pane.group_snapshots {
+                                    render_measurements(ui, &format!("Scope {}", member_id), snap);
+                                }
+                            } else if let Some(snapshot) = &pane.active_snapshot {
+                                render_measurements(ui, "Active", snapshot);
+                            }
+                            if ui.button("Autoscale") {
+                                pane.autoscale_requested = true;
+                            }
+                            ui.separator();
+
                             // Get plot UI if ImPlot is active
                             if let Some(implot_ctx) = addons.implot {
                                 let plot_ui = ui.implot(implot_ctx);
@@ -448,7 +489,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     let lim = if snapshot.max_iq > 0.0 { snapshot.max_iq * 1.1 } else { 1.0 };
                                                     plot_ui.set_next_axes_limits(-lim, lim, -lim, lim, PlotCond::Always);
                                                     if let Some(token) = plot_ui.begin_plot_with_size(&label, [-1.0, -1.0]) {
-                                                        let _ = plot_ui.scatter_plot("IQ Constellation", &snapshot.real, &snapshot.imag);
+                                                        let scatter = ScatterPlot::new("IQ Constellation", &snapshot.real, &snapshot.imag)
+                                                            .with_marker_fill_color(REAL_COLOR);
+                                                        if scatter.validate().is_ok() {
+                                                            scatter.plot();
+                                                        }
                                                         token.end();
                                                     }
                                                 } else {
@@ -458,15 +503,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
 
-                                    // ── RMS Power Tab ──
+                                    // ── Power Tab ──
                                     if show_scatter_rms_hist2d {
-                                        if let Some(_tab) = ui.tab_item("RMS Power") {
+                                        if let Some(_tab) = ui.tab_item("Power") {
                                             if let Some(snapshot) = &pane.active_snapshot {
                                                 if !snapshot.power.is_empty() {
-                                                    let label = format!("RMS Power (Scope {})", snapshot.scope_id);
+                                                    let label = format!("Instantaneous Power (Scope {})", snapshot.scope_id);
+                                                    if pane.autoscale_requested {
+                                                        plot_ui.set_next_axes_to_fit();
+                                                        pane.autoscale_requested = false;
+                                                    }
                                                     if let Some(token) = plot_ui.begin_plot_with_size(&label, [-1.0, -1.0]) {
                                                         let power_f64: Vec<f64> = snapshot.power.iter().map(|&x| x as f64).collect();
-                                                        let _ = plot_ui.simple_line_plot("Power", &power_f64);
+                                                        let x_idx: Vec<f64> = (0..power_f64.len()).map(|i| i as f64).collect();
+                                                        let line = LinePlot::new("Power", &x_idx, &power_f64).with_line_color(REAL_COLOR);
+                                                        if line.validate().is_ok() {
+                                                            line.plot();
+                                                        }
                                                         token.end();
                                                     }
                                                 } else {
@@ -478,6 +531,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                     // ── Waveform Tab ──
                                     if let Some(_tab) = ui.tab_item("Waveform") {
+                                        if pane.autoscale_requested {
+                                            plot_ui.set_next_axes_to_fit();
+                                            pane.autoscale_requested = false;
+                                        }
                                         if pane.in_group_mode {
                                             if !pane.group_snapshots.is_empty() {
                                                 let label = format!("Group Waveform (Group {})", active_scope.group);
@@ -496,9 +553,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             if !snapshot.real.is_empty() {
                                                 let label = format!("Waveform (Scope {})", snapshot.scope_id);
                                                 if let Some(token) = plot_ui.begin_plot_with_size(&label, [-1.0, -1.0]) {
-                                                    let _ = plot_ui.simple_line_plot("Real", &snapshot.real);
+                                                    let x_idx: Vec<f64> = (0..snapshot.real.len()).map(|i| i as f64).collect();
+                                                    let real_line = LinePlot::new("Real", &x_idx, &snapshot.real).with_line_color(REAL_COLOR);
+                                                    if real_line.validate().is_ok() {
+                                                        real_line.plot();
+                                                    }
                                                     if !snapshot.imag.is_empty() {
-                                                        let _ = plot_ui.simple_line_plot("Imag", &snapshot.imag);
+                                                        let imag_line = LinePlot::new("Imag", &x_idx, &snapshot.imag).with_line_color(IMAG_COLOR);
+                                                        if imag_line.validate().is_ok() {
+                                                            imag_line.plot();
+                                                        }
                                                     }
                                                     token.end();
                                                 }
@@ -510,6 +574,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                     // ── Histogram Tab ──
                                     if let Some(_tab) = ui.tab_item("Histogram") {
+                                        if pane.autoscale_requested {
+                                            plot_ui.set_next_axes_to_fit();
+                                            pane.autoscale_requested = false;
+                                        }
                                         if pane.in_group_mode {
                                             if !pane.group_snapshots.is_empty() {
                                                 let label = format!("Group Amplitude Distribution (Group {})", active_scope.group);

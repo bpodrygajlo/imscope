@@ -38,6 +38,9 @@ pub struct PlotPane {
     pub in_group_mode: bool,
     pub ungrouped: bool,
     pub worker_scopes: Vec<(usize, ScopeType)>,
+    /// Set by an "Autoscale" button press; consumed (and reset) by whichever
+    /// tab is currently visible, applying a one-shot axes-fit there.
+    pub autoscale_requested: bool,
 }
 
 impl PlotPane {
@@ -54,6 +57,7 @@ impl PlotPane {
             in_group_mode: false,
             ungrouped: false,
             worker_scopes: Vec::new(),
+            autoscale_requested: false,
         }
     }
 }
