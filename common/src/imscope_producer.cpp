@@ -41,6 +41,20 @@ static std::string derive_control_address(const std::string& announce_addr) {
   return announce_addr + "-control";
 }
 
+// Settings are serialized on the wire in a fixed 64-byte name field
+// (imscope_setting_t::name / setting_request_t::name). Truncate to that
+// width at registration so a name comparison against a wire-truncated
+// request can never match the wrong setting.
+static std::string truncate_setting_name(const char* name) {
+  std::string s(name);
+  constexpr size_t kMaxLen =
+      sizeof(((imscope_setting_t*)nullptr)->name) - 1;
+  if (s.size() > kMaxLen) {
+    s.resize(kMaxLen);
+  }
+  return s;
+}
+
 struct SettingInfo {
   std::string name;
   setting_type_t type;
@@ -335,6 +349,59 @@ class ImscopeProducer {
   std::unordered_map<int, ScalarAccumulator> scalar_accumulators;
 
  public:
+  // Sends the accumulated scalar buffer for `id` and clears it. Caller must
+  // already hold scalar_mutex. Returns IMSCOPE_SUCCESS even if no worker is
+  // currently waiting on this scope (the buffer stays queued for later).
+  imscope_return_t send_accumulator_locked(
+      int id, ScalarAccumulator& acc,
+      std::chrono::steady_clock::time_point now) {
+    ScopeCtx* worker = nullptr;
+    {
+      std::lock_guard<std::mutex> active_lock(active_requests_mutex);
+      auto it = active_requests.find(id);
+      if (it != active_requests.end()) {
+        worker = it->second;
+        active_requests.erase(it);
+      }
+    }
+    if (!worker) {
+      return IMSCOPE_SUCCESS;
+    }
+
+    worker->req_received.store(false);
+    nng_msg* req_msg = nng_aio_get_msg(worker->recv_aio);
+    if (req_msg) {
+      nng_msg_free(req_msg);
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+    size_t size = sizeof(scope_msg_t) + sizeof(uint32_t) * acc.buffer.size();
+    nng_msg* msg_obj;
+    nng_msg_alloc(&msg_obj, size);
+    scope_msg_t* msg = (scope_msg_t*)nng_msg_body(msg_obj);
+    msg->meta = {};
+    msg->id = id;
+    msg->data_size = acc.buffer.size() * sizeof(uint32_t);
+    memcpy((void*)(msg + 1), acc.buffer.data(),
+           sizeof(uint32_t) * acc.buffer.size());
+    msg->time_taken_in_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::high_resolution_clock::now() - start)
+            .count();
+
+    nng_aio_set_msg(worker->send_aio, msg_obj);
+    nng_ctx_send(worker->ctx, worker->send_aio);
+    nng_aio_wait(worker->send_aio);
+    int rv = nng_aio_result(worker->send_aio);
+
+    nng_ctx_recv(worker->ctx, worker->recv_aio);
+
+    acc.buffer.clear();
+    acc.last_send_time = now;
+
+    return rv == 0 ? IMSCOPE_SUCCESS : IMSCOPE_ERROR_INTERNAL;
+  }
+
   imscope_return_t push_scalar_value(uint32_t val, int id) {
     std::lock_guard<std::mutex> lock(scalar_mutex);
     auto& acc = scalar_accumulators[id];
@@ -353,53 +420,7 @@ class ImscopeProducer {
     bool timeout_reached = elapsed_ms >= 30 && !acc.buffer.empty();
 
     if (threshold_reached || timeout_reached) {
-      ScopeCtx* worker = nullptr;
-      {
-        std::lock_guard<std::mutex> active_lock(active_requests_mutex);
-        auto it = active_requests.find(id);
-        if (it != active_requests.end()) {
-          worker = it->second;
-          active_requests.erase(it);
-        }
-      }
-      if (worker) {
-        worker->req_received.store(false);
-        nng_msg* req_msg = nng_aio_get_msg(worker->recv_aio);
-        if (req_msg) {
-          nng_msg_free(req_msg);
-        }
-
-        auto start = std::chrono::high_resolution_clock::now();
-        size_t size =
-            sizeof(scope_msg_t) + sizeof(uint32_t) * acc.buffer.size();
-        nng_msg* msg_obj;
-        nng_msg_alloc(&msg_obj, size);
-        scope_msg_t* msg = (scope_msg_t*)nng_msg_body(msg_obj);
-        msg->meta = {};
-        msg->id = id;
-        msg->data_size = acc.buffer.size() * sizeof(uint32_t);
-        memcpy((void*)(msg + 1), acc.buffer.data(),
-               sizeof(uint32_t) * acc.buffer.size());
-        msg->time_taken_in_ns =
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::high_resolution_clock::now() - start)
-                .count();
-
-        nng_aio_set_msg(worker->send_aio, msg_obj);
-        nng_ctx_send(worker->ctx, worker->send_aio);
-        nng_aio_wait(worker->send_aio);
-        int rv = nng_aio_result(worker->send_aio);
-
-        nng_ctx_recv(worker->ctx, worker->recv_aio);
-
-        acc.buffer.clear();
-        acc.last_send_time = now;
-
-        if (rv != 0) {
-          return IMSCOPE_ERROR_INTERNAL;
-        }
-        return IMSCOPE_SUCCESS;
-      }
+      return send_accumulator_locked(id, acc, now);
     }
     return IMSCOPE_SUCCESS;
   }
@@ -417,46 +438,7 @@ class ImscopeProducer {
                             now - acc.last_send_time)
                             .count();
       if (elapsed_ms >= 30) {
-        ScopeCtx* worker = nullptr;
-        {
-          std::lock_guard<std::mutex> active_lock(active_requests_mutex);
-          auto it = active_requests.find(id);
-          if (it != active_requests.end()) {
-            worker = it->second;
-            active_requests.erase(it);
-          }
-        }
-        if (worker) {
-          worker->req_received.store(false);
-          nng_msg* req_msg = nng_aio_get_msg(worker->recv_aio);
-          if (req_msg) {
-            nng_msg_free(req_msg);
-          }
-
-          auto start = std::chrono::high_resolution_clock::now();
-          size_t size =
-              sizeof(scope_msg_t) + sizeof(uint32_t) * acc.buffer.size();
-          nng_msg* msg_obj;
-          nng_msg_alloc(&msg_obj, size);
-          scope_msg_t* msg = (scope_msg_t*)nng_msg_body(msg_obj);
-          msg->meta = {};
-          msg->id = id;
-          msg->data_size = acc.buffer.size() * sizeof(uint32_t);
-          memcpy((void*)(msg + 1), acc.buffer.data(),
-                 sizeof(uint32_t) * acc.buffer.size());
-          msg->time_taken_in_ns =
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  std::chrono::high_resolution_clock::now() - start)
-                  .count();
-
-          nng_aio_set_msg(worker->send_aio, msg_obj);
-          nng_ctx_send(worker->ctx, worker->send_aio);
-          nng_aio_wait(worker->send_aio);
-          nng_ctx_recv(worker->ctx, worker->recv_aio);
-
-          acc.buffer.clear();
-          acc.last_send_time = now;
-        }
+        send_accumulator_locked(id, acc, now);
       }
     }
   }
@@ -481,9 +463,10 @@ class ImscopeProducer {
  public:
   imscope_return_t register_setting_bool(const char* name, bool initial_val,
                                          imscope_setting_bool_cb_t callback) {
+    std::string truncated_name = truncate_setting_name(name);
     std::lock_guard<std::mutex> lock(settings_mutex);
     for (auto& s : registered_settings) {
-      if (s.name == name) {
+      if (s.name == truncated_name) {
         s.type = SETTING_TYPE_BOOL;
         s.value.bval = initial_val;
         s.bool_cb = callback;
@@ -491,7 +474,7 @@ class ImscopeProducer {
       }
     }
     SettingInfo s;
-    s.name = name;
+    s.name = truncated_name;
     s.type = SETTING_TYPE_BOOL;
     s.value.bval = initial_val;
     s.bool_cb = callback;
@@ -501,9 +484,10 @@ class ImscopeProducer {
 
   imscope_return_t register_setting_int32(const char* name, int32_t initial_val,
                                           imscope_setting_int32_cb_t callback) {
+    std::string truncated_name = truncate_setting_name(name);
     std::lock_guard<std::mutex> lock(settings_mutex);
     for (auto& s : registered_settings) {
-      if (s.name == name) {
+      if (s.name == truncated_name) {
         s.type = SETTING_TYPE_INT32;
         s.value.ival = initial_val;
         s.int32_cb = callback;
@@ -511,7 +495,7 @@ class ImscopeProducer {
       }
     }
     SettingInfo s;
-    s.name = name;
+    s.name = truncated_name;
     s.type = SETTING_TYPE_INT32;
     s.value.ival = initial_val;
     s.int32_cb = callback;
@@ -521,9 +505,10 @@ class ImscopeProducer {
 
   imscope_return_t register_setting_float(const char* name, float initial_val,
                                           imscope_setting_float_cb_t callback) {
+    std::string truncated_name = truncate_setting_name(name);
     std::lock_guard<std::mutex> lock(settings_mutex);
     for (auto& s : registered_settings) {
-      if (s.name == name) {
+      if (s.name == truncated_name) {
         s.type = SETTING_TYPE_FLOAT;
         s.value.fval = initial_val;
         s.float_cb = callback;
@@ -531,7 +516,7 @@ class ImscopeProducer {
       }
     }
     SettingInfo s;
-    s.name = name;
+    s.name = truncated_name;
     s.type = SETTING_TYPE_FLOAT;
     s.value.fval = initial_val;
     s.float_cb = callback;
@@ -747,7 +732,12 @@ class ImscopeProducer {
     size_t size = sizeof(scope_msg_t) + sizeof(uint32_t) * num_samples;
     nng_msg* allocated_msg = nullptr;
     if (nng_msg_alloc(&allocated_msg, size) != 0) {
-      // Restart recv on failure
+      // Drop the request so a stray commit_buffer() call can't find a
+      // still-active entry and restart recv_aio a second time.
+      {
+        std::lock_guard<std::mutex> lock(active_requests_mutex);
+        active_requests.erase(id);
+      }
       nng_ctx_recv(worker->ctx, worker->recv_aio);
       return nullptr;
     }
@@ -915,7 +905,8 @@ extern "C" imscope_return_t imscope_try_send_int32(int32_t val, int id) {
   if (instance == nullptr) {
     return IMSCOPE_ERROR_NOT_INITIALIZED;
   }
-  uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
+  uint32_t val_u;
+  memcpy(&val_u, &val, sizeof(val_u));
   return instance->push_scalar_value(val_u, id);
 }
 
@@ -923,7 +914,8 @@ extern "C" imscope_return_t imscope_try_send_float(float val, int id) {
   if (instance == nullptr) {
     return IMSCOPE_ERROR_NOT_INITIALIZED;
   }
-  uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
+  uint32_t val_u;
+  memcpy(&val_u, &val, sizeof(val_u));
   return instance->push_scalar_value(val_u, id);
 }
 
@@ -933,7 +925,8 @@ extern "C" imscope_return_t imscope_try_send_int32_by_name(int32_t val,
     return IMSCOPE_ERROR_NOT_INITIALIZED;
   }
   int id = instance->get_or_register_scope(name, SCOPE_TYPE_INT32);
-  uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
+  uint32_t val_u;
+  memcpy(&val_u, &val, sizeof(val_u));
   return instance->push_scalar_value(val_u, id);
 }
 
@@ -943,7 +936,8 @@ extern "C" imscope_return_t imscope_try_send_float_by_name(float val,
     return IMSCOPE_ERROR_NOT_INITIALIZED;
   }
   int id = instance->get_or_register_scope(name, SCOPE_TYPE_FLOAT);
-  uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
+  uint32_t val_u;
+  memcpy(&val_u, &val, sizeof(val_u));
   return instance->push_scalar_value(val_u, id);
 }
 
@@ -954,7 +948,8 @@ extern "C" imscope_return_t imscope_try_send_int32_by_group(int32_t val,
     return IMSCOPE_ERROR_NOT_INITIALIZED;
   }
   int id = instance->get_or_register_scope(name, SCOPE_TYPE_INT32, group);
-  uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
+  uint32_t val_u;
+  memcpy(&val_u, &val, sizeof(val_u));
   return instance->push_scalar_value(val_u, id);
 }
 
@@ -965,7 +960,8 @@ extern "C" imscope_return_t imscope_try_send_float_by_group(float val,
     return IMSCOPE_ERROR_NOT_INITIALIZED;
   }
   int id = instance->get_or_register_scope(name, SCOPE_TYPE_FLOAT, group);
-  uint32_t val_u = *reinterpret_cast<uint32_t*>(&val);
+  uint32_t val_u;
+  memcpy(&val_u, &val, sizeof(val_u));
   return instance->push_scalar_value(val_u, id);
 }
 

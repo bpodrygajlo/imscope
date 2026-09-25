@@ -2061,11 +2061,17 @@ fn handle_mouse_click(
                     if let Some(ref mut s) = state.panes[ap].active_snapshot {
                         s.max_stacked_size = sz;
                     }
+                    for s in state.panes[ap].group_snapshots.values_mut() {
+                        s.max_stacked_size = sz;
+                    }
                 } else if relative_col >= 28 && relative_col <= 32 {
                     state.panes[ap].stacking_size =
                         (state.panes[ap].stacking_size + 1000).min(100000);
                     let sz = state.panes[ap].stacking_size;
                     if let Some(ref mut s) = state.panes[ap].active_snapshot {
+                        s.max_stacked_size = sz;
+                    }
+                    for s in state.panes[ap].group_snapshots.values_mut() {
                         s.max_stacked_size = sz;
                     }
                 }
