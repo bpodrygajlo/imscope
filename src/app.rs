@@ -130,3 +130,137 @@ pub fn send_merged_scopes<P: HasWorkerScopes>(
     }
     let _ = cmd_tx.send(WorkerCommand::SelectGroup { members: all });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn scope(name: &str, group: &str, scope_type: ScopeType) -> ScopeConfig {
+        ScopeConfig {
+            name: name.to_string(),
+            group: group.to_string(),
+            scope_type,
+        }
+    }
+
+    #[test]
+    fn activate_scope_empty_scopes_is_noop() {
+        let mut pane = PlotPane::new();
+        activate_scope(&[], 3, &mut pane);
+        assert_eq!(pane.selected_scope_idx, 0);
+        assert!(pane.worker_scopes.is_empty());
+    }
+
+    #[test]
+    fn activate_scope_clamps_out_of_bounds_idx() {
+        let scopes = vec![scope("a", "", ScopeType::Real)];
+        let mut pane = PlotPane::new();
+        activate_scope(&scopes, 5, &mut pane);
+        assert_eq!(pane.selected_scope_idx, 0);
+    }
+
+    #[test]
+    fn activate_scope_ungrouped_scope_uses_solo_mode() {
+        let scopes = vec![
+            scope("a", "", ScopeType::Real),
+            scope("b", "", ScopeType::Real),
+        ];
+        let mut pane = PlotPane::new();
+        activate_scope(&scopes, 1, &mut pane);
+
+        assert!(!pane.in_group_mode);
+        assert!(pane.active_snapshot.is_some());
+        assert!(pane.group_snapshots.is_empty());
+        assert_eq!(pane.worker_scopes, vec![(1, ScopeType::Real)]);
+    }
+
+    #[test]
+    fn activate_scope_grouped_scope_collects_all_members() {
+        let scopes = vec![
+            scope("a", "g1", ScopeType::Real),
+            scope("b", "other", ScopeType::Real),
+            scope("c", "g1", ScopeType::IqData),
+        ];
+        let mut pane = PlotPane::new();
+        activate_scope(&scopes, 0, &mut pane);
+
+        assert!(pane.in_group_mode);
+        assert!(pane.active_snapshot.is_none());
+        assert_eq!(pane.group_snapshots.len(), 2);
+        assert!(pane.group_snapshots.contains_key(&0));
+        assert!(pane.group_snapshots.contains_key(&2));
+        let mut worker_scopes = pane.worker_scopes.clone();
+        worker_scopes.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            worker_scopes,
+            vec![(0, ScopeType::Real), (2, ScopeType::IqData)]
+        );
+    }
+
+    #[test]
+    fn activate_scope_ungrouped_flag_forces_solo_mode_even_in_group() {
+        let scopes = vec![
+            scope("a", "g1", ScopeType::Real),
+            scope("b", "g1", ScopeType::Real),
+        ];
+        let mut pane = PlotPane::new();
+        pane.ungrouped = true;
+        activate_scope(&scopes, 0, &mut pane);
+
+        assert!(!pane.in_group_mode);
+        assert_eq!(pane.worker_scopes, vec![(0, ScopeType::Real)]);
+    }
+
+    #[test]
+    fn activate_scope_applies_stacking_size_to_new_snapshots() {
+        let scopes = vec![scope("a", "", ScopeType::Real)];
+        let mut pane = PlotPane::new();
+        pane.stacking_size = 42;
+        activate_scope(&scopes, 0, &mut pane);
+
+        assert_eq!(pane.active_snapshot.unwrap().max_stacked_size, 42);
+    }
+
+    struct FakePane(Vec<(usize, ScopeType)>);
+    impl HasWorkerScopes for FakePane {
+        fn worker_scopes(&self) -> &[(usize, ScopeType)] {
+            &self.0
+        }
+    }
+
+    #[test]
+    fn send_merged_scopes_dedupes_across_panes() {
+        let panes = vec![
+            FakePane(vec![(0, ScopeType::Real), (1, ScopeType::Real)]),
+            FakePane(vec![(1, ScopeType::Real), (2, ScopeType::IqData)]),
+        ];
+        let (tx, rx) = mpsc::channel();
+        send_merged_scopes(&panes, panes.len(), &tx);
+
+        match rx.try_recv().unwrap() {
+            WorkerCommand::SelectGroup { members } => {
+                assert_eq!(members, vec![(0, ScopeType::Real), (1, ScopeType::Real), (2, ScopeType::IqData)]);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn send_merged_scopes_respects_num_panes_limit() {
+        let panes = vec![
+            FakePane(vec![(0, ScopeType::Real)]),
+            FakePane(vec![(1, ScopeType::Real)]),
+        ];
+        let (tx, rx) = mpsc::channel();
+        // Only consider the first pane even though two are provided.
+        send_merged_scopes(&panes, 1, &tx);
+
+        match rx.try_recv().unwrap() {
+            WorkerCommand::SelectGroup { members } => {
+                assert_eq!(members, vec![(0, ScopeType::Real)]);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+}
