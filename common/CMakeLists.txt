@@ -28,10 +28,6 @@ add_library(imscope_consumer src/imscope_consumer.cpp)
 target_include_directories(imscope_consumer PUBLIC include/)
 target_link_libraries(imscope_consumer PUBLIC nng imscope_internal)
 
-add_library(imscope_tools src/imscope_tools.cpp)
-target_include_directories(imscope_tools PUBLIC include/)
-target_link_libraries(imscope_tools PUBLIC spdlog)
-
 if(IMSCOPE_BUILD_TESTS)
   add_subdirectory(test)
 endif()

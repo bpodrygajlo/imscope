@@ -16,11 +16,9 @@
 - [common/include/imscope_common.h](common/include/imscope_common.h): Defines common data structures used across the producer and consumer, such as `NRmetadata` (frame/slot/timestamp), `scope_msg_t` types, and shared constants/enums.
 - [common/include/imscope_producer.h](common/include/imscope_producer.h): Public C-style API for data producers. Provides functions to initialize a producer (`imscope_init_producer`) and send IQ data (`imscope_try_send_data`).
 - [common/include/imscope_consumer.h](common/include/imscope_consumer.h): C++ interface for data consumers. Defines the `ImscopeConsumer` class for connecting to producers and requesting data snapshots.
-- [common/include/imscope_tools.h](common/include/imscope_tools.h): Utility classes for processing and storing snapshots (MovingAverageTimer, IQSnapshot, VectorSnapshot).
 - [common/src/imscope_producer.cpp](common/src/imscope_producer.cpp): Implements the producer logic (Control, Data, and Announce sockets).
 - [common/src/imscope_consumer.cpp](common/src/imscope_consumer.cpp): Implements the `ImscopeConsumer` class.
 - [common/src/imscope_internal.h](common/src/imscope_internal.h) / [common/src/imscope_internal.cpp](common/src/imscope_internal.cpp): Internal utilities for NNG socket creation and error handling.
-- [common/src/imscope_tools.cpp](common/src/imscope_tools.cpp): Implementation of data processing tools.
 - [common/test/](common/test/): Unit and integration tests for core logic.
 
 ### Rust Clients (`src/`)
