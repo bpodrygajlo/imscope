@@ -8,7 +8,10 @@ use dear_app::{AddOnsConfig, AppBuilder, Theme};
 use dear_imgui_rs::{Condition, TreeNodeFlags};
 use dear_implot::*;
 
-use imscope::app::{ConnectionState, PlotPane, activate_scope, send_merged_scopes};
+use imscope::app::{
+    ConnectionState, PERSISTENCE_COLS, PERSISTENCE_ROWS, PlotPane, accumulate_persistence,
+    activate_scope, send_merged_scopes,
+};
 use imscope::consumer::{
     self as consumer, ScopeType, SettingValue, WorkerCommand, WorkerEvent, run_worker,
 };
@@ -483,16 +486,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // ── Scatter Tab ──
                                     if show_scatter_rms_hist2d {
                                         if let Some(_tab) = ui.tab_item("Scatter (IQ)") {
+                                            ui.checkbox("Persistence", &mut pane.persistence_enabled);
+                                            if pane.persistence_enabled {
+                                                ui.same_line();
+                                                if ui.button("Clear Trail") {
+                                                    pane.persistence_grid.fill(0.0);
+                                                }
+                                            }
                                             if let Some(snapshot) = &pane.active_snapshot {
                                                 if !snapshot.real.is_empty() {
                                                     let label = format!("Scatter Plot (Scope {})", snapshot.scope_id);
                                                     let lim = if snapshot.max_iq > 0.0 { snapshot.max_iq * 1.1 } else { 1.0 };
                                                     plot_ui.set_next_axes_limits(-lim, lim, -lim, lim, PlotCond::Always);
                                                     if let Some(token) = plot_ui.begin_plot_with_size(&label, [-1.0, -1.0]) {
-                                                        let scatter = ScatterPlot::new("IQ Constellation", &snapshot.real, &snapshot.imag)
-                                                            .with_marker_fill_color(REAL_COLOR);
-                                                        if scatter.validate().is_ok() {
-                                                            scatter.plot();
+                                                        if pane.persistence_enabled {
+                                                            accumulate_persistence(
+                                                                &mut pane.persistence_grid,
+                                                                PERSISTENCE_ROWS,
+                                                                PERSISTENCE_COLS,
+                                                                pane.persistence_decay,
+                                                                &snapshot.real,
+                                                                &snapshot.imag,
+                                                                lim,
+                                                            );
+                                                            let scale_max = pane
+                                                                .persistence_grid
+                                                                .iter()
+                                                                .cloned()
+                                                                .fold(1.0f32, f32::max);
+                                                            let grid_f64: Vec<f64> = pane
+                                                                .persistence_grid
+                                                                .iter()
+                                                                .map(|&v| v as f64)
+                                                                .collect();
+                                                            let cmap = push_colormap(Colormap::Hot);
+                                                            let _ = plot_ui.heatmap_plot_scaled(
+                                                                "Persistence",
+                                                                &grid_f64,
+                                                                PERSISTENCE_ROWS,
+                                                                PERSISTENCE_COLS,
+                                                                0.0,
+                                                                scale_max as f64,
+                                                                ImPlotPoint { x: -lim, y: -lim },
+                                                                ImPlotPoint { x: lim, y: lim },
+                                                            );
+                                                            drop(cmap);
+                                                        } else {
+                                                            let scatter = ScatterPlot::new("IQ Constellation", &snapshot.real, &snapshot.imag)
+                                                                .with_marker_fill_color(REAL_COLOR);
+                                                            if scatter.validate().is_ok() {
+                                                                scatter.plot();
+                                                            }
                                                         }
                                                         token.end();
                                                     }

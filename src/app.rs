@@ -41,7 +41,15 @@ pub struct PlotPane {
     /// Set by an "Autoscale" button press; consumed (and reset) by whichever
     /// tab is currently visible, applying a one-shot axes-fit there.
     pub autoscale_requested: bool,
+    /// Persistence ("color-graded"/phosphor-trail) display for the Scatter
+    /// tab: a decaying PERSISTENCE_ROWS x PERSISTENCE_COLS grid, row-major.
+    pub persistence_enabled: bool,
+    pub persistence_decay: f32,
+    pub persistence_grid: Vec<f32>,
 }
+
+pub const PERSISTENCE_ROWS: usize = 96;
+pub const PERSISTENCE_COLS: usize = 96;
 
 impl PlotPane {
     pub fn new() -> Self {
@@ -58,6 +66,9 @@ impl PlotPane {
             ungrouped: false,
             worker_scopes: Vec::new(),
             autoscale_requested: false,
+            persistence_enabled: false,
+            persistence_decay: 0.97,
+            persistence_grid: vec![0.0; PERSISTENCE_ROWS * PERSISTENCE_COLS],
         }
     }
 }
@@ -133,6 +144,46 @@ pub fn send_merged_scopes<P: HasWorkerScopes>(
         }
     }
     let _ = cmd_tx.send(WorkerCommand::SelectGroup { members: all });
+}
+
+/// Decay every cell of a persistence grid, then bin each `(real[i],
+/// imag[i])` point into it — the accumulation step behind the Scatter tab's
+/// color-graded/phosphor-trail display. `grid` is `rows*cols`, row-major,
+/// covering the square `[-lim, lim] x [-lim, lim]` (real -> column, imag ->
+/// row, flipped so positive imaginary values land toward row 0). Points
+/// outside that square, or a non-positive `lim`, leave the grid decayed but
+/// otherwise untouched.
+pub fn accumulate_persistence(
+    grid: &mut [f32],
+    rows: usize,
+    cols: usize,
+    decay: f32,
+    real: &[f64],
+    imag: &[f64],
+    lim: f64,
+) {
+    for cell in grid.iter_mut() {
+        *cell *= decay;
+    }
+    if lim <= 0.0 || rows == 0 || cols == 0 {
+        return;
+    }
+
+    let n = real.len().min(imag.len());
+    for i in 0..n {
+        let r = real[i];
+        let im = imag[i];
+        if r < -lim || r > lim || im < -lim || im > lim {
+            continue;
+        }
+        let col = (((r + lim) / (2.0 * lim)) * cols as f64) as usize;
+        let row = (((-im + lim) / (2.0 * lim)) * rows as f64) as usize;
+        let col = col.min(cols - 1);
+        let row = row.min(rows - 1);
+        if let Some(cell) = grid.get_mut(row * cols + col) {
+            *cell += 1.0;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -268,5 +319,37 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn accumulate_persistence_decays_existing_cells() {
+        let mut grid = vec![1.0f32; 4];
+        accumulate_persistence(&mut grid, 2, 2, 0.5, &[], &[], 1.0);
+        assert_eq!(grid, vec![0.5, 0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn accumulate_persistence_bins_corner_points() {
+        let mut grid = vec![0.0f32; 16]; // 4x4
+        // Top-right (max real, max imag) and bottom-left (min real, min imag).
+        accumulate_persistence(&mut grid, 4, 4, 1.0, &[2.0, -2.0], &[2.0, -2.0], 2.0);
+        assert_eq!(grid[0 * 4 + 3], 1.0); // row 0 (top), col 3 (right)
+        assert_eq!(grid[3 * 4 + 0], 1.0); // row 3 (bottom), col 0 (left)
+        assert_eq!(grid.iter().sum::<f32>(), 2.0);
+    }
+
+    #[test]
+    fn accumulate_persistence_drops_out_of_range_points() {
+        let mut grid = vec![0.0f32; 4];
+        accumulate_persistence(&mut grid, 2, 2, 1.0, &[100.0], &[0.0], 1.0);
+        assert_eq!(grid, vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn accumulate_persistence_ignores_non_positive_lim() {
+        let mut grid = vec![1.0f32; 4];
+        accumulate_persistence(&mut grid, 2, 2, 1.0, &[0.0], &[0.0], 0.0);
+        // Decay (by 1.0, a no-op here) still applies, but no binning happens.
+        assert_eq!(grid, vec![1.0, 1.0, 1.0, 1.0]);
     }
 }
