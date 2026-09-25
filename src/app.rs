@@ -46,6 +46,12 @@ pub struct PlotPane {
     pub persistence_enabled: bool,
     pub persistence_decay: f32,
     pub persistence_grid: Vec<f32>,
+    /// Measurement cursors (shared across the Waveform/Power/Spectrum tabs,
+    /// since only one tab is visible at a time). Positions are in sample
+    /// index / bin units, not time — the protocol has no sample-rate.
+    pub cursors_enabled: bool,
+    pub cursor_x1: f64,
+    pub cursor_x2: f64,
 }
 
 pub const PERSISTENCE_ROWS: usize = 96;
@@ -69,6 +75,9 @@ impl PlotPane {
             persistence_enabled: false,
             persistence_decay: 0.97,
             persistence_grid: vec![0.0; PERSISTENCE_ROWS * PERSISTENCE_COLS],
+            cursors_enabled: false,
+            cursor_x1: 0.0,
+            cursor_x2: 0.0,
         }
     }
 }
@@ -184,6 +193,23 @@ pub fn accumulate_persistence(
             *cell += 1.0;
         }
     }
+}
+
+/// Default cursor positions (25%/75% of the current sample count) used when
+/// cursors are first enabled for a pane.
+pub fn default_cursor_positions(sample_count: usize) -> (f64, f64) {
+    let n = sample_count as f64;
+    (0.25 * n, 0.75 * n)
+}
+
+/// Looks up the value in `data` nearest to sample index `x`, clamping to
+/// the valid range. Returns `None` for empty data.
+pub fn nearest_sample(data: &[f64], x: f64) -> Option<f64> {
+    if data.is_empty() {
+        return None;
+    }
+    let idx = x.round().clamp(0.0, (data.len() - 1) as f64) as usize;
+    data.get(idx).copied()
 }
 
 #[cfg(test)]
@@ -351,5 +377,30 @@ mod tests {
         accumulate_persistence(&mut grid, 2, 2, 1.0, &[0.0], &[0.0], 0.0);
         // Decay (by 1.0, a no-op here) still applies, but no binning happens.
         assert_eq!(grid, vec![1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn default_cursor_positions_is_quarter_and_three_quarters() {
+        assert_eq!(default_cursor_positions(100), (25.0, 75.0));
+        assert_eq!(default_cursor_positions(0), (0.0, 0.0));
+    }
+
+    #[test]
+    fn nearest_sample_empty_is_none() {
+        assert_eq!(nearest_sample(&[], 5.0), None);
+    }
+
+    #[test]
+    fn nearest_sample_rounds_to_closest_index() {
+        let data = [10.0, 20.0, 30.0, 40.0];
+        assert_eq!(nearest_sample(&data, 1.4), Some(20.0));
+        assert_eq!(nearest_sample(&data, 1.6), Some(30.0));
+    }
+
+    #[test]
+    fn nearest_sample_clamps_out_of_range_x() {
+        let data = [10.0, 20.0, 30.0];
+        assert_eq!(nearest_sample(&data, -5.0), Some(10.0));
+        assert_eq!(nearest_sample(&data, 100.0), Some(30.0));
     }
 }

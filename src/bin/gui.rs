@@ -44,6 +44,52 @@ fn render_measurements(ui: &dear_imgui_rs::Ui, label: &str, snap: &consumer::IQS
     ));
 }
 
+/// Draws the pane's two shared measurement cursors as draggable vertical
+/// lines. Must be called inside the currently active plot's begin/end pair.
+fn draw_cursors(pane: &mut PlotPane, pane_idx: usize) {
+    if !pane.cursors_enabled {
+        return;
+    }
+    let base = (pane_idx as i32) * 10;
+    drag_line_x(
+        DragToolId::new(base + 1),
+        &mut pane.cursor_x1,
+        [1.0, 1.0, 1.0, 0.6],
+        1.0,
+        DragToolFlags::empty(),
+    );
+    drag_line_x(
+        DragToolId::new(base + 2),
+        &mut pane.cursor_x2,
+        [1.0, 1.0, 1.0, 0.6],
+        1.0,
+        DragToolFlags::empty(),
+    );
+}
+
+/// Renders the "Cursor1/Cursor2/Δx/Δy" readout line below a plot. `series`
+/// is `(label, data)` pairs to report Δy for at the cursor positions.
+fn render_cursor_readout(ui: &dear_imgui_rs::Ui, pane: &PlotPane, series: &[(&str, &[f64])]) {
+    if !pane.cursors_enabled {
+        return;
+    }
+    let mut readout = format!(
+        "Cursor1 x={:.1} | Cursor2 x={:.1} | \u{0394}x={:.1} (samples/bins)",
+        pane.cursor_x1,
+        pane.cursor_x2,
+        pane.cursor_x2 - pane.cursor_x1
+    );
+    for (name, data) in series {
+        if let (Some(y1), Some(y2)) = (
+            imscope::app::nearest_sample(data, pane.cursor_x1),
+            imscope::app::nearest_sample(data, pane.cursor_x2),
+        ) {
+            readout.push_str(&format!(" | {} \u{0394}y={:.2}", name, y2 - y1));
+        }
+    }
+    ui.text(readout);
+}
+
 struct AppState {
     connection: ConnectionState,
     announce_url: String,
@@ -464,6 +510,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
 
+                            // ── Cursors ──
+                            let was_enabled = pane.cursors_enabled;
+                            ui.checkbox("Cursors", &mut pane.cursors_enabled);
+                            let just_enabled = pane.cursors_enabled && !was_enabled;
+                            if pane.cursors_enabled {
+                                ui.same_line();
+                                if ui.button("Reset Cursors") || just_enabled {
+                                    let n = pane.active_snapshot.as_ref().map(|s| s.size()).unwrap_or(0);
+                                    let (x1, x2) = imscope::app::default_cursor_positions(n);
+                                    pane.cursor_x1 = x1;
+                                    pane.cursor_x2 = x2;
+                                }
+                            }
+
                             // Determine tabs to render
                             let show_scatter_rms_hist2d = !pane.in_group_mode && (active_scope.scope_type == ScopeType::IqData);
 
@@ -558,15 +618,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         plot_ui.set_next_axes_to_fit();
                                                         pane.autoscale_requested = false;
                                                     }
+                                                    let power_f64: Vec<f64> = snapshot.power.iter().map(|&x| x as f64).collect();
                                                     if let Some(token) = plot_ui.begin_plot_with_size(&label, [-1.0, -1.0]) {
-                                                        let power_f64: Vec<f64> = snapshot.power.iter().map(|&x| x as f64).collect();
                                                         let x_idx: Vec<f64> = (0..power_f64.len()).map(|i| i as f64).collect();
                                                         let line = LinePlot::new("Power", &x_idx, &power_f64).with_line_color(REAL_COLOR);
                                                         if line.validate().is_ok() {
                                                             line.plot();
                                                         }
+                                                        draw_cursors(pane, pane_idx);
                                                         token.end();
                                                     }
+                                                    render_cursor_readout(ui, pane, &[("Power", &power_f64)]);
                                                 } else {
                                                     ui.text("No signal data received yet.");
                                                 }
@@ -597,20 +659,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         } else if let Some(snapshot) = &pane.active_snapshot {
                                             if !snapshot.real.is_empty() {
                                                 let label = format!("Waveform (Scope {})", snapshot.scope_id);
+                                                let real_data = snapshot.real.clone();
+                                                let imag_data = snapshot.imag.clone();
                                                 if let Some(token) = plot_ui.begin_plot_with_size(&label, [-1.0, -1.0]) {
-                                                    let x_idx: Vec<f64> = (0..snapshot.real.len()).map(|i| i as f64).collect();
-                                                    let real_line = LinePlot::new("Real", &x_idx, &snapshot.real).with_line_color(REAL_COLOR);
+                                                    let x_idx: Vec<f64> = (0..real_data.len()).map(|i| i as f64).collect();
+                                                    let real_line = LinePlot::new("Real", &x_idx, &real_data).with_line_color(REAL_COLOR);
                                                     if real_line.validate().is_ok() {
                                                         real_line.plot();
                                                     }
-                                                    if !snapshot.imag.is_empty() {
-                                                        let imag_line = LinePlot::new("Imag", &x_idx, &snapshot.imag).with_line_color(IMAG_COLOR);
+                                                    if !imag_data.is_empty() {
+                                                        let imag_line = LinePlot::new("Imag", &x_idx, &imag_data).with_line_color(IMAG_COLOR);
                                                         if imag_line.validate().is_ok() {
                                                             imag_line.plot();
                                                         }
                                                     }
+                                                    draw_cursors(pane, pane_idx);
                                                     token.end();
                                                 }
+                                                let mut series: Vec<(&str, &[f64])> = vec![("Real", &real_data)];
+                                                if !imag_data.is_empty() {
+                                                    series.push(("Imag", &imag_data));
+                                                }
+                                                render_cursor_readout(ui, pane, &series);
                                             } else {
                                                 ui.text("No signal data received yet.");
                                             }
@@ -693,8 +763,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                         if line.validate().is_ok() {
                                                             line.plot();
                                                         }
+                                                        draw_cursors(pane, pane_idx);
                                                         token.end();
                                                     }
+                                                    render_cursor_readout(ui, pane, &[("Magnitude (dB)", &spectrum)]);
                                                     let domain_note = match active_scope.domain {
                                                         consumer::ScopeDomain::Time => {
                                                             "FFT computed from time-domain samples (Hann window)"
