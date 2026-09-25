@@ -15,6 +15,7 @@ use imscope::app::{
 use imscope::consumer::{
     self as consumer, ScopeType, SettingValue, WorkerCommand, WorkerEvent, run_worker,
 };
+use imscope::dsp;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -664,6 +665,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                     }
                                                 } else {
                                                     ui.text("No IQ signal data received yet.");
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // ── Spectrum Tab ──
+                                    if !pane.in_group_mode {
+                                        if let Some(_tab) = ui.tab_item("Spectrum") {
+                                            if pane.autoscale_requested {
+                                                plot_ui.set_next_axes_to_fit();
+                                                pane.autoscale_requested = false;
+                                            }
+                                            if let Some(snapshot) = &pane.active_snapshot {
+                                                if !snapshot.real.is_empty() {
+                                                    let spectrum = dsp::compute_spectrum_db(
+                                                        &snapshot.real,
+                                                        &snapshot.imag,
+                                                        active_scope.domain,
+                                                    );
+                                                    let label = format!("Spectrum (Scope {})", snapshot.scope_id);
+                                                    if let Some(token) = plot_ui.begin_plot_with_size(&label, [-1.0, -1.0]) {
+                                                        let x_idx: Vec<f64> =
+                                                            (0..spectrum.len()).map(|i| i as f64).collect();
+                                                        let line = LinePlot::new("Magnitude (dB)", &x_idx, &spectrum)
+                                                            .with_line_color(REAL_COLOR);
+                                                        if line.validate().is_ok() {
+                                                            line.plot();
+                                                        }
+                                                        token.end();
+                                                    }
+                                                    let domain_note = match active_scope.domain {
+                                                        consumer::ScopeDomain::Time => {
+                                                            "FFT computed from time-domain samples (Hann window)"
+                                                        }
+                                                        consumer::ScopeDomain::Frequency => {
+                                                            "plotted directly \u{2014} scope data is already frequency-domain"
+                                                        }
+                                                    };
+                                                    ui.text_disabled(format!(
+                                                        "X axis: frequency bin (no sample-rate metadata yet) \u{2014} {}",
+                                                        domain_note
+                                                    ));
+                                                } else {
+                                                    ui.text("No signal data received yet.");
                                                 }
                                             }
                                         }
