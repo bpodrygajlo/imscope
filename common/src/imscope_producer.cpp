@@ -74,6 +74,7 @@ typedef struct {
   std::string name;
   std::string group;
   scope_type_t type;
+  scope_domain_t domain = SCOPE_DOMAIN_TIME;
 } scope_info_t;
 
 class ImscopeProducer {
@@ -190,6 +191,8 @@ class ImscopeProducer {
                       self->parent->configured_scopes[i].group.c_str(),
                       MAX_GROUP_NAME_LEN - 1);
               msg->scopes[i].type = self->parent->configured_scopes[i].type;
+              msg->scopes[i].domain =
+                  self->parent->configured_scopes[i].domain;
             }
 
             spdlog::debug(
@@ -616,14 +619,15 @@ class ImscopeProducer {
   }
 
   imscope_return_t add_scope(const char* name, scope_type_t type,
-                             const char* group = "") {
+                             const char* group = "",
+                             scope_domain_t domain = SCOPE_DOMAIN_TIME) {
     std::lock_guard<std::mutex> lock(scopes_mutex);
     for (size_t i = 0; i < configured_scopes.size(); i++) {
       if (configured_scopes[i].name == name) {
         return IMSCOPE_SUCCESS;
       }
     }
-    scope_info_t scope_info = {name, group ? group : "", type};
+    scope_info_t scope_info = {name, group ? group : "", type, domain};
     configured_scopes.push_back(scope_info);
     if (nng_socket_id(data_socket) > 0) {
       workers.push_back(std::make_unique<ScopeCtx>(this->data_socket, this));
@@ -632,14 +636,15 @@ class ImscopeProducer {
   }
 
   int get_or_register_scope(const char* name, scope_type_t type,
-                            const char* group = "") {
+                            const char* group = "",
+                            scope_domain_t domain = SCOPE_DOMAIN_TIME) {
     std::lock_guard<std::mutex> lock(scopes_mutex);
     for (size_t i = 0; i < configured_scopes.size(); i++) {
       if (configured_scopes[i].name == name) {
         return static_cast<int>(i);
       }
     }
-    scope_info_t scope_info = {name, group ? group : "", type};
+    scope_info_t scope_info = {name, group ? group : "", type, domain};
     configured_scopes.push_back(scope_info);
     if (nng_socket_id(data_socket) > 0) {
       workers.push_back(std::make_unique<ScopeCtx>(this->data_socket, this));
@@ -818,7 +823,8 @@ extern "C" imscope_return_t imscope_init_producer(const char* data_address,
   instance->clear_scopes();
   if (scopes != nullptr) {
     for (size_t i = 0; i < num_scopes; ++i) {
-      instance->add_scope(scopes[i].name, scopes[i].type);
+      instance->add_scope(scopes[i].name, scopes[i].type, "",
+                          scopes[i].domain);
     }
   }
   instance->connect(data_address, announce_address, name);
@@ -830,6 +836,15 @@ extern "C" int imscope_register_scope(const char* name, scope_type_t type) {
     return IMSCOPE_ERROR_NOT_INITIALIZED;
   }
   return instance->get_or_register_scope(name, type);
+}
+
+extern "C" int imscope_register_scope_with_domain(const char* name,
+                                                   scope_type_t type,
+                                                   scope_domain_t domain) {
+  if (instance == nullptr) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
+  return instance->get_or_register_scope(name, type, "", domain);
 }
 
 extern "C" imscope_return_t imscope_try_send_data_by_name(

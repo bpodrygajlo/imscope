@@ -22,11 +22,23 @@ pub enum ScopeType {
     Float = 3,
 }
 
+/// Whether a scope's samples are raw time-domain data or already
+/// frequency-domain (e.g. post-FFT resource-grid symbols from a signal
+/// processing pipeline). Mirrors `scope_domain_t` in imscope_common.h.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(i32)]
+pub enum ScopeDomain {
+    #[default]
+    Time = 0,
+    Frequency = 1,
+}
+
 #[derive(Debug, Clone)]
 pub struct ScopeConfig {
     pub name: String,
     pub group: String,
     pub scope_type: ScopeType,
+    pub domain: ScopeDomain,
 }
 
 #[derive(Debug, Clone)]
@@ -218,7 +230,7 @@ pub fn parse_announce_response(bytes: &[u8]) -> Result<AnnounceResponse, String>
     }
 
     let mut scopes = Vec::new();
-    let scope_size = 132; // 64 name + 64 group + 4 type
+    let scope_size = 136; // 64 name + 64 group + 4 type + 4 domain
     let expected_len = 388 + (num_scopes as usize) * scope_size;
     if bytes.len() < expected_len {
         return Err(format!(
@@ -242,10 +254,18 @@ pub fn parse_announce_response(bytes: &[u8]) -> Result<AnnounceResponse, String>
             3 => ScopeType::Float,
             _ => return Err(format!("Unknown scope type {}", scope_type_val)),
         };
+        let domain_val =
+            i32::from_ne_bytes(bytes[offset + 132..offset + 136].try_into().unwrap());
+        let domain = match domain_val {
+            0 => ScopeDomain::Time,
+            1 => ScopeDomain::Frequency,
+            _ => return Err(format!("Unknown scope domain {}", domain_val)),
+        };
         scopes.push(ScopeConfig {
             name: scope_name,
             group: scope_group,
             scope_type,
+            domain,
         });
     }
 
@@ -946,7 +966,18 @@ mod tests {
         name: &str,
         scopes: &[(&str, &str, i32)],
     ) -> Vec<u8> {
-        let scope_size = 132usize;
+        let scopes_with_domain: Vec<(&str, &str, i32, i32)> =
+            scopes.iter().map(|&(n, g, t)| (n, g, t, 0)).collect();
+        make_announce_bytes_with_domain(data_addr, ctrl_addr, name, &scopes_with_domain)
+    }
+
+    fn make_announce_bytes_with_domain(
+        data_addr: &str,
+        ctrl_addr: &str,
+        name: &str,
+        scopes: &[(&str, &str, i32, i32)],
+    ) -> Vec<u8> {
+        let scope_size = 136usize;
         let mut bytes = vec![0u8; 388 + scopes.len() * scope_size];
         let copy_str = |dst: &mut [u8], s: &str| {
             let b = s.as_bytes();
@@ -957,11 +988,12 @@ mod tests {
         copy_str(&mut bytes[128..256], ctrl_addr);
         copy_str(&mut bytes[256..384], name);
         bytes[384..388].copy_from_slice(&(scopes.len() as i32).to_ne_bytes());
-        for (i, &(sname, sgroup, stype)) in scopes.iter().enumerate() {
+        for (i, &(sname, sgroup, stype, sdomain)) in scopes.iter().enumerate() {
             let off = 388 + i * scope_size;
             copy_str(&mut bytes[off..off + 64], sname);
             copy_str(&mut bytes[off + 64..off + 128], sgroup);
             bytes[off + 128..off + 132].copy_from_slice(&stype.to_ne_bytes());
+            bytes[off + 132..off + 136].copy_from_slice(&sdomain.to_ne_bytes());
         }
         bytes
     }
@@ -1032,6 +1064,25 @@ mod tests {
     #[test]
     fn test_parse_announce_unknown_scope_type() {
         let bytes = make_announce_bytes("d", "c", "n", &[("A", "", 99)]);
+        assert!(parse_announce_response(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_parse_announce_domain_field_roundtrips() {
+        let bytes = make_announce_bytes_with_domain(
+            "d",
+            "c",
+            "n",
+            &[("TimeScope", "", 1, 0), ("FreqScope", "", 1, 1)],
+        );
+        let res = parse_announce_response(&bytes).unwrap();
+        assert_eq!(res.scopes[0].domain, ScopeDomain::Time);
+        assert_eq!(res.scopes[1].domain, ScopeDomain::Frequency);
+    }
+
+    #[test]
+    fn test_parse_announce_unknown_scope_domain() {
+        let bytes = make_announce_bytes_with_domain("d", "c", "n", &[("A", "", 1, 7)]);
         assert!(parse_announce_response(&bytes).is_err());
     }
 

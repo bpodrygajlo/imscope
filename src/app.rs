@@ -134,6 +134,7 @@ pub fn send_merged_scopes<P: HasWorkerScopes>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consumer::ScopeDomain;
     use std::sync::mpsc;
 
     fn scope(name: &str, group: &str, scope_type: ScopeType) -> ScopeConfig {
@@ -141,6 +142,7 @@ mod tests {
             name: name.to_string(),
             group: group.to_string(),
             scope_type,
+            domain: ScopeDomain::Time,
         }
     }
 

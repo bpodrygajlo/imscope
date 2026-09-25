@@ -24,6 +24,9 @@ extern "C" {
 typedef struct {
   const char* name;
   scope_type_t type;
+  // Defaults to SCOPE_DOMAIN_TIME when omitted from an aggregate
+  // initializer (e.g. `{"scope1", SCOPE_TYPE_IQ_DATA}`).
+  scope_domain_t domain;
 } imscope_scope_desc_t;
 
 imscope_return_t imscope_init_producer(const char* data_address,
@@ -39,6 +42,17 @@ imscope_return_t imscope_init_producer(const char* data_address,
  * @return Assigned scope ID, or IMSCOPE_ERROR_NOT_INITIALIZED / IMSCOPE_ERROR_INTERNAL
  */
 int imscope_register_scope(const char* name, scope_type_t type);
+
+/**
+ * @brief Register a scope dynamically with an explicit domain tag.
+ * @param name Scope name
+ * @param type Scope type
+ * @param domain Whether the scope's samples are time-domain or already
+ *               frequency-domain
+ * @return Assigned scope ID, or IMSCOPE_ERROR_NOT_INITIALIZED / IMSCOPE_ERROR_INTERNAL
+ */
+int imscope_register_scope_with_domain(const char* name, scope_type_t type,
+                                       scope_domain_t domain);
 
 /**
  * @brief Send data to a scope by name.
