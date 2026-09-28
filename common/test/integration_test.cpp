@@ -6,34 +6,117 @@
  */
 
 #include <gtest/gtest.h>
-#include <nng/nng.h>
-#include <nng/protocol/reqrep0/req.h>
 #include <spdlog/spdlog.h>
+#include <zenoh.hxx>
+#include <atomic>
 #include <chrono>
+#include <cstring>
+#include <string>
 #include <thread>
+#include <variant>
+#include <vector>
+#include "imscope_common.h"
 #include "imscope_consumer.h"
+#include "imscope_internal.h"
 #include "imscope_producer.h"
+
+// ── Deterministic, same-machine Zenoh pairing for tests ─────────────────────
+//
+// Zenoh has no direct equivalent to NNG's named `inproc://` transport, so
+// this file's producer/consumer pairs are wired together over an explicit
+// `tcp/127.0.0.1:<port>` endpoint instead: the producer session is made to
+// also *listen* on that endpoint (via the `g_test_extra_listen_locator` test
+// hook in `imscope_internal.h`) and the consumer session *connects* to it
+// directly. This avoids depending on Zenoh's default multicast scouting,
+// which may be slow or unavailable in sandboxed/CI environments. Multicast
+// scouting is also disabled outright (`g_test_disable_multicast_scouting`)
+// for every session opened while running this binary, for determinism.
+//
+// Each test gets its own port (a simple incrementing counter) so that
+// back-to-back tests in the same process never race to bind the same port
+// while a previous test's socket is still being released.
+
+namespace {
+
+std::atomic<int> g_next_test_port{27500};
+
+std::string next_test_endpoint() {
+  int port = g_next_test_port.fetch_add(1);
+  return "tcp/127.0.0.1:" + std::to_string(port);
+}
+
+// Runs once, before any TEST() body in this binary, so every session opened
+// by this test binary -- including ones opened deep inside
+// `imscope_init_producer`/`ImscopeConsumer::connect` -- skips multicast
+// scouting.
+bool g_disable_scouting_for_tests = [] {
+  g_test_disable_multicast_scouting = true;
+  return true;
+}();
+
+// Initializes a producer that also listens on `endpoint`, in addition to
+// whatever `imscope_init_producer` itself does. Mirrors how a real caller
+// would invoke `imscope_init_producer`, plus the test-only listen hook.
+imscope_return_t init_test_producer(const std::string& endpoint,
+                                    const char* name,
+                                    imscope_scope_desc_t* scopes,
+                                    size_t num_scopes) {
+  g_test_extra_listen_locator = endpoint;
+  imscope_return_t res = imscope_init_producer("", "", name, scopes, num_scopes);
+  g_test_extra_listen_locator.clear();
+  return res;
+}
+
+// Sends one raw control request/reply round trip directly against a
+// producer's control key expression, bypassing `ImscopeConsumer` -- used by
+// the settings test below, which wants to exercise the wire-level control
+// protocol directly the way the old test dialed the NNG control socket
+// directly.
+std::vector<uint8_t> control_request(zenoh::Session& session, const std::string& name,
+                                     const void* req, size_t req_size) {
+  std::string key = "imscope/" + name + "/control";
+  std::vector<uint8_t> req_bytes(req_size);
+  std::memcpy(req_bytes.data(), req, req_size);
+
+  zenoh::Session::GetOptions options = zenoh::Session::GetOptions::create_default();
+  options.payload = zenoh::Bytes(std::move(req_bytes));
+  options.timeout_ms = 2000;
+
+  auto replies = session.get(key, "", zenoh::channels::FifoChannel(1), std::move(options));
+  auto res = replies.recv();
+  if (!std::holds_alternative<zenoh::Reply>(res)) {
+    return {};
+  }
+  zenoh::Reply& reply = std::get<zenoh::Reply>(res);
+  if (!reply.is_ok()) {
+    return {};
+  }
+  return reply.get_ok().get_payload().as_vector();
+}
+
+}  // namespace
 
 TEST(IntegrationTest, ProducerConsumerInprocMultiScope) {
   spdlog::set_level(spdlog::level::debug);
 
-  const char* data_addr = "inproc://data_multi";
-  const char* announce_addr = "inproc://announce_multi";
+  std::string endpoint = next_test_endpoint();
   const char* producer_name = "test_producer_multi";
 
   imscope_scope_desc_t scopes[] = {{"scope1", SCOPE_TYPE_REAL},
                                    {"scope2", SCOPE_TYPE_REAL}};
 
   // Initialize Producer
-  imscope_return_t res =
-      imscope_init_producer(data_addr, announce_addr, producer_name, scopes, 2);
+  imscope_return_t res = init_test_producer(endpoint, producer_name, scopes, 2);
   ASSERT_EQ(res, IMSCOPE_SUCCESS);
 
-  // Give some time for threads to start
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  // Give some time for the session/queryables to be ready. Opening the
+  // very first Zenoh session in the process can carry some one-time
+  // runtime warm-up cost, so this is a bit more generous than the
+  // steady-state latency later sends see.
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
   // Initialize Consumer
-  ImscopeConsumer* consumer = ImscopeConsumer::connect(announce_addr);
+  ImscopeConsumer* consumer = ImscopeConsumer::connect(producer_name, endpoint.c_str());
   ASSERT_NE(consumer, nullptr);
   ASSERT_EQ(consumer->get_name(), producer_name);
   ASSERT_EQ(consumer->get_num_scopes(), 2);
@@ -49,12 +132,16 @@ TEST(IntegrationTest, ProducerConsumerInprocMultiScope) {
   uint64_t timestamp = 1000;
 
   // 1. Send data for scope 0 (succeeds)
-  // Use a small retry loop because of internal NNG latency
+  // Use a retry loop because of internal Zenoh latency -- this is the
+  // first request/reply round trip of the test, which can occasionally be
+  // slower than later ones (session/transport establishment isn't
+  // necessarily fully settled the instant `connect()` returns), so this
+  // loop gets a more generous budget than later ones in this file.
   int retry = 0;
   while ((res = imscope_try_send_data(data1, 0, num_samples, 1, 0,
                                       timestamp)) == IMSCOPE_ERROR_BUSY &&
-         retry < 100) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+         retry < 500) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
     retry++;
   }
   ASSERT_EQ(res, IMSCOPE_SUCCESS);
@@ -121,19 +208,18 @@ TEST(IntegrationTest, ProducerConsumerInprocMultiScope) {
 }
 
 TEST(IntegrationTest, ZeroCopySend) {
-  const char* data_addr = "inproc://data_zerocopy";
-  const char* announce_addr = "inproc://announce_zerocopy";
+  std::string endpoint = next_test_endpoint();
 
   imscope_scope_desc_t scopes[] = {{"zerocopy_scope", SCOPE_TYPE_REAL}};
 
-  imscope_return_t rv = imscope_init_producer(data_addr, announce_addr,
-                                              "ZeroCopyProducer", scopes, 1);
+  imscope_return_t rv =
+      init_test_producer(endpoint, "ZeroCopyProducer", scopes, 1);
   ASSERT_EQ(rv, IMSCOPE_SUCCESS);
 
-  ImscopeConsumer* consumer = ImscopeConsumer::connect(announce_addr);
+  ImscopeConsumer* consumer = ImscopeConsumer::connect("ZeroCopyProducer", endpoint.c_str());
   ASSERT_NE(consumer, nullptr);
 
-  // 1. Request data (synchronous REQ/REP)
+  // 1. Request data
   consumer->request_data(0);
 
   // 2. Zero-copy send
@@ -183,16 +269,15 @@ TEST(IntegrationTest, ZeroCopySend) {
 }
 
 TEST(IntegrationTest, DynamicRegistrationBySend) {
-  const char* data_addr = "inproc://data_dynamic_send";
-  const char* announce_addr = "inproc://announce_dynamic_send";
+  std::string endpoint = next_test_endpoint();
 
   // Initialize Producer with NO scopes
-  imscope_return_t rv = imscope_init_producer(
-      data_addr, announce_addr, "DynamicSendProducer", nullptr, 0);
+  imscope_return_t rv =
+      init_test_producer(endpoint, "DynamicSendProducer", nullptr, 0);
   ASSERT_EQ(rv, IMSCOPE_SUCCESS);
 
   // Connect Consumer
-  ImscopeConsumer* consumer = ImscopeConsumer::connect(announce_addr);
+  ImscopeConsumer* consumer = ImscopeConsumer::connect("DynamicSendProducer", endpoint.c_str());
   ASSERT_NE(consumer, nullptr);
   EXPECT_EQ(consumer->get_num_scopes(), 0);  // No scopes initially
 
@@ -250,16 +335,15 @@ TEST(IntegrationTest, DynamicRegistrationBySend) {
 }
 
 TEST(IntegrationTest, DynamicRegistrationZeroCopyByName) {
-  const char* data_addr = "inproc://data_dynamic_zc";
-  const char* announce_addr = "inproc://announce_dynamic_zc";
+  std::string endpoint = next_test_endpoint();
 
   // Initialize Producer with NO scopes
-  imscope_return_t rv = imscope_init_producer(data_addr, announce_addr,
-                                              "DynamicZCProducer", nullptr, 0);
+  imscope_return_t rv =
+      init_test_producer(endpoint, "DynamicZCProducer", nullptr, 0);
   ASSERT_EQ(rv, IMSCOPE_SUCCESS);
 
   // Connect Consumer
-  ImscopeConsumer* consumer = ImscopeConsumer::connect(announce_addr);
+  ImscopeConsumer* consumer = ImscopeConsumer::connect("DynamicZCProducer", endpoint.c_str());
   ASSERT_NE(consumer, nullptr);
   EXPECT_EQ(consumer->get_num_scopes(), 0);
 
@@ -320,17 +404,15 @@ TEST(IntegrationTest, DynamicRegistrationZeroCopyByName) {
 }
 
 TEST(IntegrationTest, ScalarPublishing) {
-  const char* data_addr = "inproc://data_scalar";
-  const char* announce_addr = "inproc://announce_scalar";
+  std::string endpoint = next_test_endpoint();
 
   imscope_scope_desc_t scopes[] = {{"scope_int32", SCOPE_TYPE_INT32},
                                    {"scope_float", SCOPE_TYPE_FLOAT}};
 
-  imscope_return_t rv = imscope_init_producer(data_addr, announce_addr,
-                                              "ScalarProducer", scopes, 2);
+  imscope_return_t rv = init_test_producer(endpoint, "ScalarProducer", scopes, 2);
   ASSERT_EQ(rv, IMSCOPE_SUCCESS);
 
-  ImscopeConsumer* consumer = ImscopeConsumer::connect(announce_addr);
+  ImscopeConsumer* consumer = ImscopeConsumer::connect("ScalarProducer", endpoint.c_str());
   ASSERT_NE(consumer, nullptr);
 
   // Trigger requests
@@ -429,12 +511,10 @@ void test_float_cb(float val) {
 }
 
 TEST(IntegrationTest, SettingsManagement) {
-  const char* data_addr = "inproc://data_settings";
-  const char* announce_addr = "inproc://announce_settings";
-  const char* control_addr = "inproc://announce_settings-control";
+  std::string endpoint = next_test_endpoint();
+  const char* producer_name = "SettingsProducer";
 
-  imscope_return_t rv = imscope_init_producer(data_addr, announce_addr,
-                                              "SettingsProducer", nullptr, 0);
+  imscope_return_t rv = init_test_producer(endpoint, producer_name, nullptr, 0);
   ASSERT_EQ(rv, IMSCOPE_SUCCESS);
 
   // Register settings after initialization
@@ -442,27 +522,20 @@ TEST(IntegrationTest, SettingsManagement) {
   imscope_register_setting_int32("int_setting", 42, test_int32_cb);
   imscope_register_setting_float("float_setting", 3.14f, test_float_cb);
 
-  // Connect control client
-  nng_socket ctrl_sock;
-  nng_req0_open(&ctrl_sock);
-  int nng_res = nng_dial(ctrl_sock, control_addr, NULL, 0);
-  ASSERT_EQ(nng_res, 0);
+  // Connect a raw control client directly against the control key
+  // expression (mirrors the old test dialing the NNG control socket
+  // directly, to exercise the wire-level settings protocol without going
+  // through ImscopeConsumer).
+  zenoh::Session ctrl_session = open_zenoh_session(endpoint.c_str());
 
   // 1. Send GET_ALL request
   setting_request_t req = {};
   req.magic = SETTING_REQ_GET_ALL;
-  nng_msg* req_msg;
-  nng_msg_alloc(&req_msg, sizeof(setting_request_t));
-  memcpy(nng_msg_body(req_msg), &req, sizeof(setting_request_t));
+  std::vector<uint8_t> rep_bytes =
+      control_request(ctrl_session, producer_name, &req, sizeof(req));
+  ASSERT_GE(rep_bytes.size(), sizeof(setting_response_t) - sizeof(imscope_setting_t));
 
-  nng_res = nng_sendmsg(ctrl_sock, req_msg, 0);
-  ASSERT_EQ(nng_res, 0);
-
-  nng_msg* rep_msg;
-  nng_res = nng_recvmsg(ctrl_sock, &rep_msg, 0);
-  ASSERT_EQ(nng_res, 0);
-
-  setting_response_t* rep = (setting_response_t*)nng_msg_body(rep_msg);
+  setting_response_t* rep = (setting_response_t*)rep_bytes.data();
   EXPECT_EQ(rep->magic, SETTING_REP_GET_ALL);
   EXPECT_EQ(rep->status, 0);
   EXPECT_EQ(rep->num_settings, 3);
@@ -487,7 +560,6 @@ TEST(IntegrationTest, SettingsManagement) {
   EXPECT_TRUE(found_bool);
   EXPECT_TRUE(found_int);
   EXPECT_TRUE(found_float);
-  nng_msg_free(rep_msg);
 
   // 2. Send SET request for bool_setting
   setting_request_t set_req = {};
@@ -496,18 +568,11 @@ TEST(IntegrationTest, SettingsManagement) {
   set_req.type = SETTING_TYPE_BOOL;
   set_req.value.bval = 0;  // false
 
-  nng_msg_alloc(&req_msg, sizeof(setting_request_t));
-  memcpy(nng_msg_body(req_msg), &set_req, sizeof(setting_request_t));
-  nng_res = nng_sendmsg(ctrl_sock, req_msg, 0);
-  ASSERT_EQ(nng_res, 0);
-
-  nng_res = nng_recvmsg(ctrl_sock, &rep_msg, 0);
-  ASSERT_EQ(nng_res, 0);
-
-  rep = (setting_response_t*)nng_msg_body(rep_msg);
+  rep_bytes = control_request(ctrl_session, producer_name, &set_req, sizeof(set_req));
+  ASSERT_GE(rep_bytes.size(), sizeof(setting_response_t) - sizeof(imscope_setting_t));
+  rep = (setting_response_t*)rep_bytes.data();
   EXPECT_EQ(rep->magic, SETTING_REP_SET);
   EXPECT_EQ(rep->status, 0);
-  nng_msg_free(rep_msg);
 
   // Check callback
   EXPECT_TRUE(bool_cb_called);
@@ -520,23 +585,15 @@ TEST(IntegrationTest, SettingsManagement) {
   set_req.type = SETTING_TYPE_INT32;
   set_req.value.ival = 100;
 
-  nng_msg_alloc(&req_msg, sizeof(setting_request_t));
-  memcpy(nng_msg_body(req_msg), &set_req, sizeof(setting_request_t));
-  nng_res = nng_sendmsg(ctrl_sock, req_msg, 0);
-  ASSERT_EQ(nng_res, 0);
-
-  nng_res = nng_recvmsg(ctrl_sock, &rep_msg, 0);
-  ASSERT_EQ(nng_res, 0);
-
-  rep = (setting_response_t*)nng_msg_body(rep_msg);
+  rep_bytes = control_request(ctrl_session, producer_name, &set_req, sizeof(set_req));
+  ASSERT_GE(rep_bytes.size(), sizeof(setting_response_t) - sizeof(imscope_setting_t));
+  rep = (setting_response_t*)rep_bytes.data();
   EXPECT_EQ(rep->magic, SETTING_REP_SET);
   EXPECT_EQ(rep->status, 0);
-  nng_msg_free(rep_msg);
 
   // Check callback
   EXPECT_TRUE(int32_cb_called);
   EXPECT_EQ(int32_cb_val, 100);
 
-  nng_close(ctrl_sock);
   imscope_cleanup_producer();
 }

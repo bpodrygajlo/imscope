@@ -5,68 +5,31 @@
  * See LICENSE file in the project root for full license information.
  */
 
-#include <nng/nng.h>
-#include <nng/protocol/pipeline0/push.h>
-#include <nng/protocol/reqrep0/rep.h>
-#include <nng/protocol/reqrep0/req.h>
-#include <cstdlib>
-#include <iostream>
-
-#include <cstdarg>
-
-#include "imscope_common.h"
 #include "imscope_internal.h"
 
-void FatalError(const char* format, ...) {
-  std::cerr << "Fatal error: ";
-  va_list args;
-  va_start(args, format);
-  vfprintf(stderr, format, args);
-  va_end(args);
-  std::cerr << std::endl;
-  std::abort();
-}
+#include <iostream>
 
-nng_socket create_nng_push_socket(const char* address) {
-  nng_socket socket;
-  int rv = nng_push0_open(&socket);
-  if (rv != 0) {
-    FatalError("nng_push0_open failed: %s", nng_strerror(rv));
-  }
+std::string g_test_extra_listen_locator;
+bool g_test_disable_multicast_scouting = false;
 
-  rv = nng_listen(socket, address, NULL, 0);
-  if (rv != 0) {
-    FatalError("nng_listen failed address %s: %s", address, nng_strerror(rv));
+zenoh::Session open_zenoh_session(const char* locator) {
+  auto config = zenoh::Config::create_default();
+  if (locator != nullptr && locator[0] != '\0') {
+    // Mirrors the Rust side's `config.insert_json5("connect/endpoints",
+    // &format!("[{loc:?}]"))` (see `producer/src/producer.rs::new` and
+    // `src/consumer.rs::open_session`): a JSON5 array containing the single
+    // explicit endpoint to dial, instead of relying on default scouting.
+    std::string locator_json5 = std::string("[\"") + locator + "\"]";
+    config.insert_json5("connect/endpoints", locator_json5);
   }
-  return socket;
-}
-
-nng_socket create_nng_req_socket(const char* address) {
-  nng_socket socket;
-  int rv = nng_req0_open(&socket);
-  if (rv != 0) {
-    FatalError("nng_req0_open failed: %s", nng_strerror(rv));
+  if (!g_test_extra_listen_locator.empty()) {
+    std::string listen_json5 = std::string("[\"") + g_test_extra_listen_locator + "\"]";
+    config.insert_json5("listen/endpoints", listen_json5);
   }
-
-  rv = nng_dial(socket, address, NULL, NNG_FLAG_NONBLOCK);
-  if (rv != 0) {
-    FatalError("nng_dial failed: %s", nng_strerror(rv));
+  if (g_test_disable_multicast_scouting) {
+    config.insert_json5("scouting/multicast/enabled", "false");
   }
-  return socket;
-}
-
-nng_socket create_nng_rep_socket(const char* address) {
-  nng_socket socket;
-  int rv = nng_rep0_open(&socket);
-  if (rv != 0) {
-    FatalError("nng_rep0_open failed: %s", nng_strerror(rv));
-  }
-
-  rv = nng_listen(socket, address, NULL, 0);
-  if (rv != 0) {
-    FatalError("nng_listen failed address %s: %s", address, nng_strerror(rv));
-  }
-  return socket;
+  return zenoh::Session::open(std::move(config));
 }
 
 void print_announce_response(announce_response_t* msg) {

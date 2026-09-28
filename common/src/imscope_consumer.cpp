@@ -6,151 +6,181 @@
  */
 
 #include "imscope_consumer.h"
-#include <nng/nng.h>
-#include <nng/protocol/pipeline0/pull.h>
-#include <nng/protocol/reqrep0/req.h>
+
 #include <spdlog/spdlog.h>
 #include <cstddef>
+#include <cstring>
 #include <mutex>
-#include <queue>
-#include <thread>
+#include <string>
+#include <variant>
 #include <vector>
+
 #include "imscope_common.h"
 #include "imscope_internal.h"
 
-struct ImscopeConsumer::ScopeCtx {
-  nng_ctx ctx;
-  nng_aio* send_aio;
-  nng_aio* recv_aio;
-
-  ScopeCtx(nng_socket socket) {
-    nng_ctx_open(&ctx, socket);
-    nng_aio_alloc(&send_aio, NULL, NULL);
-    nng_aio_alloc(&recv_aio, NULL, NULL);
-  }
-
-  ~ScopeCtx() {
-    nng_aio_free(send_aio);
-    nng_aio_free(recv_aio);
-    nng_ctx_close(ctx);
-  }
-};
-
-NngMsgPtr make_nng_msg_ptr(nng_msg* msg) {
-  if (!msg)
-    return nullptr;
-  return NngMsgPtr(nng_msg_body(msg), [msg](void*) { nng_msg_free(msg); });
+// Wraps a heap-allocated byte buffer (a Zenoh reply's payload) in a
+// `NngMsgPtr`, using `shared_ptr`'s aliasing constructor so the returned
+// pointer refers directly to the buffer's first byte (where the wire
+// `scope_msg_t` starts) while the backing `vector` is what actually keeps
+// the memory alive.
+static NngMsgPtr make_owned_msg_ptr(std::vector<uint8_t>&& bytes) {
+  auto storage = std::make_shared<std::vector<uint8_t>>(std::move(bytes));
+  void* data_ptr = storage->data();
+  return NngMsgPtr(storage, data_ptr);
 }
 
-ImscopeConsumer::ImscopeConsumer(const char* data_address, int num_scopes,
+ImscopeConsumer::ImscopeConsumer(zenoh::Session&& session_in, int num_scopes,
                                  imscope_scope_config_t* scopes,
                                  const char* name)
-    : data_address(data_address),
+    : name(name),
+      session(std::move(session_in)),
       configured_scopes(scopes, scopes + num_scopes),
-      name(name) {
-  this->data_socket = create_nng_req_socket(data_address);
+      scope_pending(num_scopes) {}
 
-  for (size_t i = 0; i < configured_scopes.size(); i++) {
-    scope_contexts.push_back(std::make_unique<ScopeCtx>(this->data_socket));
-  }
-}
-
-ImscopeConsumer::~ImscopeConsumer() {
-  nng_close(data_socket);
-}
+ImscopeConsumer::~ImscopeConsumer() = default;
 
 imscope_return_t ImscopeConsumer::request_data(int scope_id) {
   std::lock_guard<std::mutex> lock(scopes_mutex);
-  if (scope_id >= (int)scope_contexts.size()) {
+  if (scope_id < 0 || scope_id >= (int)configured_scopes.size()) {
     return IMSCOPE_ERROR_INVALID_ID;
   }
-  auto& sc = scope_contexts[scope_id];
 
-  // Only allow request if we are not already waiting for one
-  if (nng_aio_result(sc->recv_aio) == -1) {
+  // Only allow a new request if we are not already waiting for one --
+  // mirrors the NNG version's `nng_aio_result(sc->recv_aio) == -1` "still in
+  // progress" guard.
+  if (scope_pending[scope_id].has_value()) {
     return IMSCOPE_SUCCESS;
   }
 
-  nng_msg* msg;
-  nng_msg_alloc(&msg, sizeof(scope_request_t));
-  scope_request_t* req = (scope_request_t*)nng_msg_body(msg);
-  req->magic = SCOPE_REQ_MSG_ID;
-  req->scope_id = scope_id;
+  if (!session.has_value()) {
+    return IMSCOPE_ERROR_NOT_INITIALIZED;
+  }
 
-  nng_aio_set_msg(sc->send_aio, msg);
-  nng_ctx_send(sc->ctx, sc->send_aio);
-  nng_aio_wait(sc->send_aio);
+  std::string key_expr = "imscope/" + name + "/data/" + std::to_string(scope_id);
 
-  // Restart recv immediately to wait for the response
-  nng_ctx_recv(sc->ctx, sc->recv_aio);
+  scope_request_t req;
+  req.magic = SCOPE_REQ_MSG_ID;
+  req.scope_id = scope_id;
+  std::vector<uint8_t> req_bytes(sizeof(req));
+  std::memcpy(req_bytes.data(), &req, sizeof(req));
+
+  zenoh::Session::GetOptions options = zenoh::Session::GetOptions::create_default();
+  options.payload = zenoh::Bytes(std::move(req_bytes));
+  options.timeout_ms = 1000;
+
+  // `session->get()` sends the query and returns immediately -- replies are
+  // delivered asynchronously into the returned channel by Zenoh's own
+  // runtime, exactly like `nng_ctx_send()` firing off a request without
+  // blocking for the response. `try_collect_scope_msg()` below polls this
+  // channel the same way it used to poll `nng_aio_result()`.
+  try {
+    auto handler =
+        session->get(key_expr, "", zenoh::channels::FifoChannel(1), std::move(options));
+    scope_pending[scope_id].emplace(std::move(handler));
+  } catch (const zenoh::ZException& e) {
+    spdlog::error("ImscopeConsumer: failed to send data request for scope {}: {}",
+                  scope_id, e.what());
+    return IMSCOPE_ERROR_INTERNAL;
+  }
+
   return IMSCOPE_SUCCESS;
 }
 
 NngMsgPtr ImscopeConsumer::try_collect_scope_msg(int scope_id, int& version) {
   std::lock_guard<std::mutex> lock(scopes_mutex);
-  if (scope_id >= (int)scope_contexts.size()) {
+  if (scope_id < 0 || scope_id >= (int)configured_scopes.size()) {
     return nullptr;
   }
-  auto& sc = scope_contexts[scope_id];
-
-  // Check if REQ is ready
-  // nng_aio_result returns -1 (NNG_EINPROGRESS) if the operation is still pending.
-  // If it's 0, it means the previous recv completed. If it's anything else, it's an error.
-  int rv = nng_aio_result(sc->recv_aio);
-  if (rv == -1) {  // In progress, no message yet
-    return nullptr;
-  } else if (rv != 0) {  // An error occurred
-    spdlog::error(
-        "ImscopeConsumer: nng_aio_result on recv_aio returned error: {}",
-        nng_strerror(rv));
+  if (!scope_pending[scope_id].has_value()) {
     return nullptr;
   }
 
-  nng_msg* msg = nng_aio_get_msg(sc->recv_aio);
+  auto result = scope_pending[scope_id]->try_recv();
+  if (std::holds_alternative<zenoh::channels::RecvError>(result)) {
+    if (std::get<zenoh::channels::RecvError>(result) ==
+        zenoh::channels::RecvError::Z_NODATA) {
+      return nullptr;  // Still waiting, no reply (or timeout) yet.
+    }
+    // Z_DISCONNECTED: the query's timeout elapsed (or the producer vanished)
+    // without ever replying. Clear the pending slot so the next
+    // `request_data()` call is free to fire a new request for this scope --
+    // the same silent, retry-next-tick drop a NNG `RecvTimeout` expiry got.
+    scope_pending[scope_id].reset();
+    return nullptr;
+  }
+
+  // A reply arrived: this request is no longer outstanding, whether or not
+  // the reply itself carried an error.
+  zenoh::Reply& reply = std::get<zenoh::Reply>(result);
+  bool ok = reply.is_ok();
+  std::vector<uint8_t> bytes;
+  if (ok) {
+    bytes = reply.get_ok().get_payload().as_vector();
+  }
+  scope_pending[scope_id].reset();
+
+  if (!ok) {
+    spdlog::error("ImscopeConsumer: scope {} query reply carried an error",
+                  scope_id);
+    return nullptr;
+  }
+
   version++;
-  return make_nng_msg_ptr(msg);
+  return make_owned_msg_ptr(std::move(bytes));
 }
 
-ImscopeConsumer* ImscopeConsumer::connect(const char* announce_address) {
-  nng_socket req_sock;
-  int rv = nng_req0_open(&req_sock);
-  if (rv != 0) {
-    return nullptr;
-  }
-  rv = nng_dial(req_sock, announce_address, NULL, NNG_FLAG_NONBLOCK);
-  if (rv != 0) {
-    nng_close(req_sock);
-    return nullptr;
-  }
-
-  nng_duration timeout = 2000;  // milliseconds
-  nng_socket_set_ms(req_sock, NNG_OPT_RECVTIMEO, timeout);
-
-  nng_msg* req_msg;
-  rv = nng_msg_alloc(&req_msg, sizeof(announce_request_t));
-  if (rv != 0) {
-    FatalError("Failed to allocate memory for announce message");
-  }
-
-  announce_request_t* announce_msg = (announce_request_t*)nng_msg_body(req_msg);
-  announce_msg->magic = ANNOUNCE_MSG_ID;
-  nng_sendmsg(req_sock, req_msg, 0);
-
-  nng_msg* res_msg;
-  rv = nng_recvmsg(req_sock, &res_msg, 0);
-  if (rv != 0) {
-    nng_close(req_sock);
+ImscopeConsumer* ImscopeConsumer::connect(const char* name, const char* locator) {
+  std::optional<zenoh::Session> session;
+  try {
+    session.emplace(open_zenoh_session(locator));
+  } catch (const zenoh::ZException& e) {
+    spdlog::error(
+        "ImscopeConsumer: failed to open Zenoh session (locator='{}'): {}",
+        locator ? locator : "", e.what());
     return nullptr;
   }
 
-  announce_response_t* response = (announce_response_t*)nng_msg_body(res_msg);
+  std::string announce_key = std::string("imscope/") + name + "/announce";
+  uint32_t magic = ANNOUNCE_MSG_ID;
+  std::vector<uint8_t> req_bytes(sizeof(magic));
+  std::memcpy(req_bytes.data(), &magic, sizeof(magic));
+
+  zenoh::Session::GetOptions options = zenoh::Session::GetOptions::create_default();
+  options.payload = zenoh::Bytes(std::move(req_bytes));
+  options.timeout_ms = 2000;  // milliseconds, matches the old NNG RecvTimeo.
+
+  std::vector<uint8_t> response_bytes;
+  try {
+    auto replies =
+        session->get(announce_key, "", zenoh::channels::FifoChannel(1), std::move(options));
+    auto res = replies.recv();
+    if (!std::holds_alternative<zenoh::Reply>(res)) {
+      spdlog::error("ImscopeConsumer: no announce reply from producer '{}'", name);
+      return nullptr;
+    }
+    zenoh::Reply& reply = std::get<zenoh::Reply>(res);
+    if (!reply.is_ok()) {
+      spdlog::error("ImscopeConsumer: announce reply from '{}' carried an error",
+                    name);
+      return nullptr;
+    }
+    response_bytes = reply.get_ok().get_payload().as_vector();
+  } catch (const zenoh::ZException& e) {
+    spdlog::error("ImscopeConsumer: announce query to '{}' failed: {}", name,
+                  e.what());
+    return nullptr;
+  }
+
+  if (response_bytes.size() < sizeof(announce_response_t) - sizeof(imscope_scope_config_t)) {
+    spdlog::error("ImscopeConsumer: announce reply from '{}' was too small", name);
+    return nullptr;
+  }
+
+  announce_response_t* response =
+      reinterpret_cast<announce_response_t*>(response_bytes.data());
   print_announce_response(response);
-  auto consumer =
-      new ImscopeConsumer(response->data_address, response->num_scopes,
-                          response->scopes, response->name);
-  consumer->announce_address = announce_address;
-  nng_msg_free(res_msg);
-  nng_close(req_sock);
+  auto consumer = new ImscopeConsumer(std::move(*session), response->num_scopes,
+                                      response->scopes, response->name);
   return consumer;
 }
 
@@ -201,52 +231,53 @@ bool ImscopeConsumer::try_collect_real(int scope_id,
 }
 
 bool ImscopeConsumer::refresh_scopes() {
-  nng_socket req_sock;
-  int rv = nng_req0_open(&req_sock);
-  if (rv != 0) {
-    return false;
-  }
-  rv = nng_dial(req_sock, announce_address.c_str(), NULL, NNG_FLAG_NONBLOCK);
-  if (rv != 0) {
-    nng_close(req_sock);
+  if (!session.has_value()) {
     return false;
   }
 
-  nng_duration timeout = 200;  // 200 milliseconds, fast enough to avoid UI lag
-  nng_socket_set_ms(req_sock, NNG_OPT_RECVTIMEO, timeout);
+  std::string announce_key = "imscope/" + name + "/announce";
+  uint32_t magic = ANNOUNCE_MSG_ID;
+  std::vector<uint8_t> req_bytes(sizeof(magic));
+  std::memcpy(req_bytes.data(), &magic, sizeof(magic));
 
-  nng_msg* req_msg;
-  rv = nng_msg_alloc(&req_msg, sizeof(announce_request_t));
-  if (rv != 0) {
-    nng_close(req_sock);
+  zenoh::Session::GetOptions options = zenoh::Session::GetOptions::create_default();
+  options.payload = zenoh::Bytes(std::move(req_bytes));
+  options.timeout_ms = 200;  // fast enough to avoid UI lag, matches old value
+
+  std::vector<uint8_t> response_bytes;
+  try {
+    auto replies =
+        session->get(announce_key, "", zenoh::channels::FifoChannel(1), std::move(options));
+    auto res = replies.recv();
+    if (!std::holds_alternative<zenoh::Reply>(res)) {
+      return false;
+    }
+    zenoh::Reply& reply = std::get<zenoh::Reply>(res);
+    if (!reply.is_ok()) {
+      return false;
+    }
+    response_bytes = reply.get_ok().get_payload().as_vector();
+  } catch (const zenoh::ZException&) {
     return false;
   }
 
-  announce_request_t* announce_msg = (announce_request_t*)nng_msg_body(req_msg);
-  announce_msg->magic = ANNOUNCE_MSG_ID;
-  nng_sendmsg(req_sock, req_msg, 0);
-
-  nng_msg* res_msg;
-  rv = nng_recvmsg(req_sock, &res_msg, 0);
-  if (rv != 0) {
-    nng_close(req_sock);
+  if (response_bytes.size() < sizeof(announce_response_t) - sizeof(imscope_scope_config_t)) {
     return false;
   }
+  announce_response_t* response =
+      reinterpret_cast<announce_response_t*>(response_bytes.data());
 
-  announce_response_t* response = (announce_response_t*)nng_msg_body(res_msg);
   {
     std::lock_guard<std::mutex> lock(scopes_mutex);
     size_t old_size = configured_scopes.size();
     if (response->num_scopes > (int)old_size) {
       for (int i = old_size; i < response->num_scopes; i++) {
         configured_scopes.push_back(response->scopes[i]);
-        scope_contexts.push_back(std::make_unique<ScopeCtx>(this->data_socket));
+        scope_pending.emplace_back();  // no request pending yet for the new scope
       }
     }
   }
 
-  nng_msg_free(res_msg);
-  nng_close(req_sock);
   return true;
 }
 

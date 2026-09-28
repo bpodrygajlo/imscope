@@ -15,9 +15,10 @@
 int main() {
   imscope_scope_desc_t scopes[] = {{"zero_copy_sine", SCOPE_TYPE_FLOAT}};
 
-  imscope_return_t rv =
-      imscope_init_producer("tcp://127.0.0.1:5555", "tcp://127.0.0.1:5556",
-                            "ZeroCopyProducer", scopes, 1);
+  // `data_address` is deprecated/unused; the second parameter is now an
+  // optional Zenoh locator to explicitly connect to -- "" relies on Zenoh's
+  // default scouting/discovery instead.
+  imscope_return_t rv = imscope_init_producer("", "", "ZeroCopyProducer", scopes, 1);
   if (rv != IMSCOPE_SUCCESS) {
     std::cerr << "Failed to initialize producer" << std::endl;
     return 1;

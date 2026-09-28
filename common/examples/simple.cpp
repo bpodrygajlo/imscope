@@ -16,8 +16,10 @@ int main() {
   imscope_scope_desc_t scopes[] = {
       {"test", scope_type_t::SCOPE_TYPE_REAL},
   };
-  imscope_init_producer("tcp://127.0.0.1:5556", "tcp://127.0.0.1:5557", "test",
-                        scopes, 1);
+  // `data_address` is deprecated/unused; the second parameter is now an
+  // optional Zenoh locator to explicitly connect to -- "" relies on Zenoh's
+  // default scouting/discovery instead.
+  imscope_init_producer("", "", "test", scopes, 1);
   int data_produced = 0;
   std::random_device rd;
   std::mt19937 gen(rd());
