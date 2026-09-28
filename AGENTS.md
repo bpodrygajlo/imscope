@@ -31,3 +31,6 @@
 - [CMakeLists.txt](CMakeLists.txt): Root build configuration for C++ modules.
 - [README.md](README.md): General documentation, installation, and usage guide.
 - [.pre-commit-config.yaml](.pre-commit-config.yaml): Code quality checks.
+
+## Commit Policy
+- Do not add AI co-authorship trailers (e.g. `Co-Authored-By: Claude ...`) to commit messages or PR descriptions in this repo.
