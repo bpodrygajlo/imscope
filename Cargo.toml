@@ -1,3 +1,7 @@
+[workspace]
+members = ["producer"]
+resolver = "2"
+
 [package]
 name = "imscope"
 version = "0.1.0"

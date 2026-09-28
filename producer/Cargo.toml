@@ -1,0 +1,13 @@
+[package]
+name = "imscope-producer-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Native Rust producer for the imscope Zenoh wire protocol"
+license = "MIT"
+
+[lib]
+name = "imscope_producer_rs"
+path = "src/lib.rs"
+
+[dependencies]
+zenoh = "1.10.1"
