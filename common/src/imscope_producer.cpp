@@ -47,8 +47,7 @@ static std::string derive_control_address(const std::string& announce_addr) {
 // request can never match the wrong setting.
 static std::string truncate_setting_name(const char* name) {
   std::string s(name);
-  constexpr size_t kMaxLen =
-      sizeof(((imscope_setting_t*)nullptr)->name) - 1;
+  constexpr size_t kMaxLen = sizeof(((imscope_setting_t*)nullptr)->name) - 1;
   if (s.size() > kMaxLen) {
     s.resize(kMaxLen);
   }
@@ -191,8 +190,7 @@ class ImscopeProducer {
                       self->parent->configured_scopes[i].group.c_str(),
                       MAX_GROUP_NAME_LEN - 1);
               msg->scopes[i].type = self->parent->configured_scopes[i].type;
-              msg->scopes[i].domain =
-                  self->parent->configured_scopes[i].domain;
+              msg->scopes[i].domain = self->parent->configured_scopes[i].domain;
             }
 
             spdlog::debug(
@@ -823,8 +821,7 @@ extern "C" imscope_return_t imscope_init_producer(const char* data_address,
   instance->clear_scopes();
   if (scopes != nullptr) {
     for (size_t i = 0; i < num_scopes; ++i) {
-      instance->add_scope(scopes[i].name, scopes[i].type, "",
-                          scopes[i].domain);
+      instance->add_scope(scopes[i].name, scopes[i].type, "", scopes[i].domain);
     }
   }
   instance->connect(data_address, announce_address, name);
@@ -839,8 +836,8 @@ extern "C" int imscope_register_scope(const char* name, scope_type_t type) {
 }
 
 extern "C" int imscope_register_scope_with_domain(const char* name,
-                                                   scope_type_t type,
-                                                   scope_domain_t domain) {
+                                                  scope_type_t type,
+                                                  scope_domain_t domain) {
   if (instance == nullptr) {
     return IMSCOPE_ERROR_NOT_INITIALIZED;
   }
