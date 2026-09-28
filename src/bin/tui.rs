@@ -1847,7 +1847,11 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
                         frame.render_widget(msg, chunks[1]);
                     } else {
                         let y_lo = spectrum.iter().cloned().fold(f64::MAX, f64::min);
-                        let y_hi = spectrum.iter().cloned().fold(f64::MIN, f64::max).max(y_lo + 1.0);
+                        let y_hi = spectrum
+                            .iter()
+                            .cloned()
+                            .fold(f64::MIN, f64::max)
+                            .max(y_lo + 1.0);
                         let num_bins = spectrum.len();
                         let domain_label = match domain {
                             consumer::ScopeDomain::Time => "FFT, Hann window",

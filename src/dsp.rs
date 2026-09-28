@@ -5,8 +5,8 @@
  * See LICENSE file in the project root for full license information.
  */
 
-use rustfft::num_complex::Complex;
 use rustfft::FftPlanner;
+use rustfft::num_complex::Complex;
 
 use crate::consumer::ScopeDomain;
 
@@ -21,10 +21,7 @@ fn hann_window(n: usize) -> Vec<f64> {
         return vec![1.0; n];
     }
     (0..n)
-        .map(|i| {
-            0.5 * (1.0
-                - (2.0 * std::f64::consts::PI * i as f64 / (n as f64 - 1.0)).cos())
-        })
+        .map(|i| 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / (n as f64 - 1.0)).cos()))
         .collect()
 }
 

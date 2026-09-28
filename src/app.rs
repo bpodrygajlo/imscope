@@ -323,7 +323,14 @@ mod tests {
 
         match rx.try_recv().unwrap() {
             WorkerCommand::SelectGroup { members } => {
-                assert_eq!(members, vec![(0, ScopeType::Real), (1, ScopeType::Real), (2, ScopeType::IqData)]);
+                assert_eq!(
+                    members,
+                    vec![
+                        (0, ScopeType::Real),
+                        (1, ScopeType::Real),
+                        (2, ScopeType::IqData)
+                    ]
+                );
             }
             _ => panic!("unexpected command"),
         }
@@ -359,7 +366,7 @@ mod tests {
         let mut grid = vec![0.0f32; 16]; // 4x4
         // Top-right (max real, max imag) and bottom-left (min real, min imag).
         accumulate_persistence(&mut grid, 4, 4, 1.0, &[2.0, -2.0], &[2.0, -2.0], 2.0);
-        assert_eq!(grid[0 * 4 + 3], 1.0); // row 0 (top), col 3 (right)
+        assert_eq!(grid[3], 1.0); // row 0 (top), col 3 (right)
         assert_eq!(grid[3 * 4 + 0], 1.0); // row 3 (bottom), col 0 (left)
         assert_eq!(grid.iter().sum::<f32>(), 2.0);
     }

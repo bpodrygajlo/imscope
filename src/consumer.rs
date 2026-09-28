@@ -265,8 +265,7 @@ pub fn parse_announce_response(bytes: &[u8]) -> Result<AnnounceResponse, String>
             3 => ScopeType::Float,
             _ => return Err(format!("Unknown scope type {}", scope_type_val)),
         };
-        let domain_val =
-            i32::from_ne_bytes(bytes[offset + 132..offset + 136].try_into().unwrap());
+        let domain_val = i32::from_ne_bytes(bytes[offset + 132..offset + 136].try_into().unwrap());
         let domain = match domain_val {
             0 => ScopeDomain::Time,
             1 => ScopeDomain::Frequency,
