@@ -25,7 +25,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         Bar, BarChart, BarGroup, Block, Borders, List, ListItem, ListState, Paragraph, Tabs,
-        canvas::{Canvas, Points},
+        canvas::Canvas,
     },
 };
 
@@ -35,12 +35,20 @@ use imscope::app::{
 use imscope::consumer::{
     self as consumer, ScopeConfig, ScopeType, WorkerCommand, WorkerEvent, run_worker,
 };
+use imscope::tui_render;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "TUI client for imscope using Ratatui")]
 struct Args {
-    #[arg(short, long, default_value = "tcp://127.0.0.1:5557")]
-    announce_url: String,
+    /// Zenoh producer name (the `imscope/<name>/...` key-expression prefix).
+    #[arg(long, default_value = "imscope")]
+    producer: String,
+
+    /// Optional explicit Zenoh locator to connect to (e.g.
+    /// "tcp/127.0.0.1:7447"). If omitted, relies on Zenoh's default
+    /// scouting/discovery.
+    #[arg(long)]
+    zenoh_connect: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,8 +135,9 @@ impl PlotPane {
 
 struct AppState {
     connection: ConnectionState,
-    announce_url: String,
-    url_editing: bool,
+    producer_name: String,
+    zenoh_locator: Option<String>,
+    producer_editing: bool,
 
     panes: [PlotPane; 2],
     num_panes: usize,   // 0, 1, or 2
@@ -151,11 +160,12 @@ struct AppState {
 }
 
 impl AppState {
-    pub fn new(announce_url: String) -> Self {
+    pub fn new(producer_name: String, zenoh_locator: Option<String>) -> Self {
         Self {
             connection: ConnectionState::Disconnected(None),
-            announce_url,
-            url_editing: false,
+            producer_name,
+            zenoh_locator,
+            producer_editing: false,
             panes: [PlotPane::new(), PlotPane::new()],
             num_panes: 1,
             active_pane: 0,
@@ -163,7 +173,7 @@ impl AppState {
             frame_rate_counter: 0,
             last_frame_rate_calc: Instant::now(),
             current_fps: 0.0,
-            status_message: "Press 'i' or 'e' to edit Connection URL, then 'Enter' to Connect"
+            status_message: "Press 'i' or 'e' to edit producer name, then 'Enter' to Connect"
                 .to_string(),
             status_msg_time: Some(Instant::now()),
             settings: Vec::new(),
@@ -213,12 +223,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_worker(cmd_rx, event_tx);
     });
 
-    let mut app_state = AppState::new(args.announce_url.clone());
+    let mut app_state = AppState::new(args.producer.clone(), args.zenoh_connect.clone());
 
-    app_state.status_message = format!("Connecting to {}...", args.announce_url);
+    app_state.status_message = format!("Connecting to producer '{}'...", args.producer);
     app_state.status_msg_time = Some(Instant::now());
     let _ = cmd_tx.send(WorkerCommand::Connect {
-        url: args.announce_url,
+        name: args.producer,
+        locator: args.zenoh_connect,
     });
 
     let mut last_tick = Instant::now();
@@ -362,25 +373,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
-                        if app_state.url_editing {
+                        if app_state.producer_editing {
                             match key.code {
                                 KeyCode::Enter => {
-                                    app_state.url_editing = false;
-                                    app_state.status_message =
-                                        format!("Connecting to {}...", app_state.announce_url);
+                                    app_state.producer_editing = false;
+                                    app_state.status_message = format!(
+                                        "Connecting to producer '{}'...",
+                                        app_state.producer_name
+                                    );
                                     app_state.status_msg_time = Some(Instant::now());
                                     let _ = cmd_tx.send(WorkerCommand::Connect {
-                                        url: app_state.announce_url.clone(),
+                                        name: app_state.producer_name.clone(),
+                                        locator: app_state.zenoh_locator.clone(),
                                     });
                                 }
                                 KeyCode::Esc => {
-                                    app_state.url_editing = false;
+                                    app_state.producer_editing = false;
                                 }
                                 KeyCode::Backspace => {
-                                    app_state.announce_url.pop();
+                                    app_state.producer_name.pop();
                                 }
                                 KeyCode::Char(c) => {
-                                    app_state.announce_url.push(c);
+                                    app_state.producer_name.push(c);
                                 }
                                 _ => {}
                             }
@@ -452,15 +466,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             match key.code {
                                 KeyCode::Char('q') => break,
                                 KeyCode::Char('c') => {
-                                    app_state.status_message =
-                                        format!("Reconnecting to {}...", app_state.announce_url);
+                                    app_state.status_message = format!(
+                                        "Reconnecting to producer '{}'...",
+                                        app_state.producer_name
+                                    );
                                     app_state.status_msg_time = Some(Instant::now());
                                     let _ = cmd_tx.send(WorkerCommand::Connect {
-                                        url: app_state.announce_url.clone(),
+                                        name: app_state.producer_name.clone(),
+                                        locator: app_state.zenoh_locator.clone(),
                                     });
                                 }
                                 KeyCode::Char('e') | KeyCode::Char('i') => {
-                                    app_state.url_editing = true;
+                                    app_state.producer_editing = true;
                                 }
                                 // ── Pane management ──────────────────────────
                                 KeyCode::Char('p') => {
@@ -960,7 +977,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
         ),
     };
 
-    let url_style = if state.url_editing {
+    let producer_style = if state.producer_editing {
         Style::default().fg(Color::Black).bg(Color::Yellow)
     } else {
         Style::default().fg(Color::Cyan)
@@ -975,14 +992,14 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let conn_lines = vec![
         Line::from(vec![Span::raw("Status: "), status_span]),
         Line::from(vec![
-            Span::raw("Announcer: "),
-            Span::styled(&state.announce_url, url_style),
+            Span::raw("Producer: "),
+            Span::styled(&state.producer_name, producer_style),
         ]),
         Line::from(vec![
-            Span::raw(if state.url_editing {
+            Span::raw(if state.producer_editing {
                 "✍️ Editing - press Enter to Connect"
             } else {
-                "Press 'i' to edit connection URL"
+                "Press 'i' to edit producer name"
             })
             .fg(Color::DarkGray),
         ]),
@@ -995,7 +1012,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, state: &mut AppState) {
     let conn_block = Block::default()
         .borders(Borders::ALL)
         .title(" Connection Server ")
-        .border_style(Style::default().fg(if state.url_editing {
+        .border_style(Style::default().fg(if state.producer_editing {
             Color::Yellow
         } else {
             Color::DarkGray
@@ -1629,259 +1646,24 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
             AppTab::Settings => unreachable!(),
         }
     } else if let Some(ref snapshot) = pane.active_snapshot {
-        if snapshot.size() == 0 {
-            let msg = Paragraph::new(
-                "\n\nNo scope data received yet.\nEnable 'Auto Collect' or press 'r'.",
-            )
-            .alignment(Alignment::Center)
-            .fg(Color::DarkGray)
-            .block(plot_block);
-            frame.render_widget(msg, chunks[1]);
-        } else {
-            match display_tab {
-                AppTab::Scatter => {
-                    if let ConnectionState::Connected { ref scopes, .. } = state.connection {
-                        if scopes[pane.selected_scope_idx].scope_type != ScopeType::IqData {
-                            let msg = Paragraph::new(
-                                "\n\nScatter/Constellation plot is only available for IQ scopes.",
-                            )
-                            .alignment(Alignment::Center)
-                            .fg(Color::Yellow)
-                            .block(plot_block);
-                            frame.render_widget(msg, chunks[1]);
-                            // still render metadata below
-                        } else {
-                            let limit = (snapshot.max_iq as f64 * 1.2).max(1.0);
-                            let skip = (snapshot.real.len() / 2000).max(1);
-                            let points = snapshot
-                                .real
-                                .iter()
-                                .zip(snapshot.imag.iter())
-                                .step_by(skip)
-                                .map(|(&r, &im)| (r as f64, im as f64))
-                                .collect::<Vec<(f64, f64)>>();
-                            let canvas = Canvas::default()
-                                .block(
-                                    plot_block.title(" Constellation Scatterplot (Imag vs Real) "),
-                                )
-                                .x_bounds([-limit, limit])
-                                .y_bounds([-limit, limit])
-                                .paint(move |ctx| {
-                                    ctx.draw(&ratatui::widgets::canvas::Line {
-                                        x1: -limit,
-                                        y1: 0.0,
-                                        x2: limit,
-                                        y2: 0.0,
-                                        color: Color::DarkGray,
-                                    });
-                                    ctx.draw(&ratatui::widgets::canvas::Line {
-                                        x1: 0.0,
-                                        y1: -limit,
-                                        x2: 0.0,
-                                        y2: limit,
-                                        color: Color::DarkGray,
-                                    });
-                                    ctx.draw(&Points {
-                                        coords: &points,
-                                        color: Color::Cyan,
-                                    });
-                                    ctx.print(
-                                        -limit * 0.95,
-                                        limit * 0.85,
-                                        format!("Max IQ: {:.0}", limit).fg(Color::Gray),
-                                    );
-                                });
-                            frame.render_widget(canvas, chunks[1]);
-                        }
-                    }
-                }
-                AppTab::Rms => {
-                    if let ConnectionState::Connected { ref scopes, .. } = state.connection {
-                        if scopes[pane.selected_scope_idx].scope_type != ScopeType::IqData {
-                            let msg = Paragraph::new(
-                                "\n\nRMS Power plot is only available for IQ scopes.",
-                            )
-                            .alignment(Alignment::Center)
-                            .fg(Color::Yellow)
-                            .block(plot_block);
-                            frame.render_widget(msg, chunks[1]);
-                        } else {
-                            let max_p = (snapshot.max_power as f64 * 1.1).max(1.0);
-                            let num_samples = snapshot.power.len();
-                            let canvas = Canvas::default()
-                                .block(plot_block.title(" RMS Power over Samples (r^2 + im^2) "))
-                                .x_bounds([0.0, num_samples as f64])
-                                .y_bounds([0.0, max_p])
-                                .paint(move |ctx| {
-                                    ctx.draw(&ratatui::widgets::canvas::Line {
-                                        x1: 0.0,
-                                        y1: max_p * 0.5,
-                                        x2: num_samples as f64,
-                                        y2: max_p * 0.5,
-                                        color: Color::Indexed(236),
-                                    });
-                                    let step = (num_samples / 500).max(1);
-                                    for i in (0..num_samples.saturating_sub(step)).step_by(step) {
-                                        ctx.draw(&ratatui::widgets::canvas::Line {
-                                            x1: i as f64,
-                                            y1: snapshot.power[i] as f64,
-                                            x2: (i + step) as f64,
-                                            y2: snapshot.power[i + step] as f64,
-                                            color: Color::Yellow,
-                                        });
-                                    }
-                                    ctx.print(
-                                        0.0,
-                                        max_p * 0.9,
-                                        format!("Max Power: {:.0}", max_p).fg(Color::Gray),
-                                    );
-                                });
-                            frame.render_widget(canvas, chunks[1]);
-                        }
-                    }
-                }
-                AppTab::Waveform => {
-                    let is_scalar = matches!(
-                        active_scope_type_for_meta,
-                        Some(ScopeType::Int32) | Some(ScopeType::Float)
-                    );
-                    let num_samples = snapshot.real.len();
-                    let (y_lo, y_hi, title) = if is_scalar {
-                        let margin = ((snapshot.max_val - snapshot.min_val) * 0.1).max(1.0);
-                        (
-                            snapshot.min_val - margin,
-                            snapshot.max_val + margin,
-                            " Values (Time Series) ",
-                        )
-                    } else {
-                        let limit = (snapshot.max_iq * 1.1).max(1.0);
-                        (-limit, limit, " Real Amplitudes Waveform ")
-                    };
-                    let canvas = Canvas::default()
-                        .block(plot_block.title(title))
-                        .x_bounds([0.0, num_samples as f64])
-                        .y_bounds([y_lo, y_hi])
-                        .paint(move |ctx| {
-                            let baseline = 0.0_f64.clamp(y_lo, y_hi);
-                            ctx.draw(&ratatui::widgets::canvas::Line {
-                                x1: 0.0,
-                                y1: baseline,
-                                x2: num_samples as f64,
-                                y2: baseline,
-                                color: Color::DarkGray,
-                            });
-                            let step = (num_samples / 500).max(1);
-                            for i in (0..num_samples.saturating_sub(step)).step_by(step) {
-                                ctx.draw(&ratatui::widgets::canvas::Line {
-                                    x1: i as f64,
-                                    y1: snapshot.real[i],
-                                    x2: (i + step) as f64,
-                                    y2: snapshot.real[i + step],
-                                    color: Color::Green,
-                                });
-                            }
-                            ctx.print(
-                                0.0,
-                                y_hi * 0.9,
-                                format!("Range: [{:.1}, {:.1}]", y_lo, y_hi).fg(Color::Gray),
-                            );
-                        });
-                    frame.render_widget(canvas, chunks[1]);
-                }
-                AppTab::Histogram => {
-                    let is_scalar = matches!(
-                        active_scope_type_for_meta,
-                        Some(ScopeType::Int32) | Some(ScopeType::Float)
-                    );
-                    let num_bins = 20;
-                    let mut bin_counts = vec![0u64; num_bins];
-                    let (range_lo, range_hi) = if is_scalar {
-                        let lo = snapshot.min_val as f32;
-                        let hi = (snapshot.max_val as f32).max(lo + 1.0);
-                        (lo, hi)
-                    } else {
-                        let limit = snapshot.max_iq.max(1.0) as f32;
-                        (-limit, limit)
-                    };
-                    let bin_width = (range_hi - range_lo) / (num_bins as f32);
-                    for &val in &snapshot.real {
-                        let idx =
-                            (((val as f32 - range_lo) / bin_width) as usize).min(num_bins - 1);
-                        bin_counts[idx] += 1;
-                    }
-                    let bars: Vec<Bar> = (0..num_bins)
-                        .map(|i| {
-                            let center = range_lo + (i as f32 + 0.5) * bin_width;
-                            Bar::default()
-                                .label(format!("{:.0}", center))
-                                .value(bin_counts[i])
-                                .style(Style::default().fg(Color::Magenta))
-                        })
-                        .collect();
-                    let chart = BarChart::default()
-                        .block(
-                            plot_block
-                                .title(" Amplitude Density Distribution (1D Real Histogram) "),
-                        )
-                        .data(BarGroup::default().bars(&bars))
-                        .bar_width(3)
-                        .bar_gap(1)
-                        .value_style(
-                            Style::default()
-                                .fg(Color::White)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .label_style(Style::default().fg(Color::Gray));
-                    frame.render_widget(chart, chunks[1]);
-                }
-                AppTab::Spectrum => {
-                    let domain =
-                        active_scope_domain_for_meta.unwrap_or(consumer::ScopeDomain::Time);
-                    let spectrum =
-                        imscope::dsp::compute_spectrum_db(&snapshot.real, &snapshot.imag, domain);
-                    if spectrum.is_empty() {
-                        let msg = Paragraph::new("\n\nNo signal data received yet.")
-                            .alignment(Alignment::Center)
-                            .fg(Color::DarkGray)
-                            .block(plot_block);
-                        frame.render_widget(msg, chunks[1]);
-                    } else {
-                        let y_lo = spectrum.iter().cloned().fold(f64::MAX, f64::min);
-                        let y_hi = spectrum
-                            .iter()
-                            .cloned()
-                            .fold(f64::MIN, f64::max)
-                            .max(y_lo + 1.0);
-                        let num_bins = spectrum.len();
-                        let domain_label = match domain {
-                            consumer::ScopeDomain::Time => "FFT, Hann window",
-                            consumer::ScopeDomain::Frequency => "direct, already freq-domain",
-                        };
-                        let canvas = Canvas::default()
-                            .block(plot_block.title(format!(
-                                " Spectrum [{}] (dB vs. frequency bin) ",
-                                domain_label
-                            )))
-                            .x_bounds([0.0, num_bins as f64])
-                            .y_bounds([y_lo, y_hi])
-                            .paint(move |ctx| {
-                                let step = (num_bins / 500).max(1);
-                                for i in (0..num_bins.saturating_sub(step)).step_by(step) {
-                                    ctx.draw(&ratatui::widgets::canvas::Line {
-                                        x1: i as f64,
-                                        y1: spectrum[i],
-                                        x2: (i + step) as f64,
-                                        y2: spectrum[i + step],
-                                        color: Color::Cyan,
-                                    });
-                                }
-                            });
-                        frame.render_widget(canvas, chunks[1]);
-                    }
-                }
-                AppTab::Settings => unreachable!(),
-            }
-        }
+        let kind = match display_tab {
+            AppTab::Scatter => tui_render::PlotKind::Scatter,
+            AppTab::Rms => tui_render::PlotKind::Rms,
+            AppTab::Waveform => tui_render::PlotKind::Waveform,
+            AppTab::Histogram => tui_render::PlotKind::Histogram,
+            AppTab::Spectrum => tui_render::PlotKind::Spectrum,
+            AppTab::Settings => unreachable!(),
+        };
+        tui_render::render_single_scope(
+            frame,
+            chunks[1],
+            plot_block,
+            kind,
+            snapshot,
+            active_scope_type_for_meta,
+            active_scope_domain_for_meta,
+            "Enable 'Auto Collect' or press 'r'.",
+        );
     } else {
         let msg = Paragraph::new(
             "\n\nNot connected to any producer.\nPlease enter announcer address on the left and connect.",
@@ -1900,75 +1682,12 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
 
     let pane = &state.panes[pane_idx];
     if let Some(ref snapshot) = pane.active_snapshot {
-        let is_scalar = matches!(
+        tui_render::render_metadata_footer(
+            frame,
+            chunks[2],
+            Some(snapshot),
             active_scope_type_for_meta,
-            Some(ScopeType::Int32) | Some(ScopeType::Float)
         );
-        let first_line = if is_scalar {
-            Line::from(vec![
-                Span::raw("Slot: "),
-                Span::styled("N/A", Style::default().fg(Color::DarkGray)),
-                Span::raw("   Frame: "),
-                Span::styled("N/A", Style::default().fg(Color::DarkGray)),
-                Span::raw("   Timestamp: "),
-                Span::styled("N/A", Style::default().fg(Color::DarkGray)),
-            ])
-        } else {
-            Line::from(vec![
-                Span::raw("Slot: "),
-                Span::styled(
-                    format!("{}", snapshot.meta.slot),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("   Frame: "),
-                Span::styled(
-                    format!("{}", snapshot.meta.frame),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("   Timestamp: "),
-                Span::styled(
-                    format!("{}", snapshot.meta.timestamp),
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ])
-        };
-        let max_label = if is_scalar {
-            "Max absolute value: "
-        } else {
-            "Max absolute IQ value: "
-        };
-        let meta_lines = vec![
-            first_line,
-            Line::from(vec![
-                Span::raw(max_label),
-                Span::styled(
-                    format!("{}", snapshot.max_iq),
-                    Style::default().fg(Color::Green),
-                ),
-                Span::raw("   Non-zero samples: "),
-                Span::styled(
-                    format!("{}", snapshot.nonzero_count),
-                    Style::default().fg(Color::Green),
-                ),
-                Span::raw("   Total stacked: "),
-                Span::styled(
-                    format!("{}", snapshot.size()),
-                    Style::default().fg(Color::Green),
-                ),
-                Span::raw("   RMS Power: "),
-                Span::styled(
-                    format!("{:.2}", consumer::rms_power(&snapshot.power)),
-                    Style::default().fg(Color::Green),
-                ),
-            ]),
-        ];
-        frame.render_widget(Paragraph::new(meta_lines).block(meta_block), chunks[2]);
     } else if pane.in_group_mode {
         let group_name = if let ConnectionState::Connected { ref scopes, .. } = state.connection {
             scopes
@@ -2072,12 +1791,13 @@ fn handle_mouse_click(
     let conn = sidebar_chunks[0];
     if col >= conn.x && col < conn.x + conn.width && row >= conn.y && row < conn.y + conn.height {
         if row == conn.y + 2 {
-            state.url_editing = true;
+            state.producer_editing = true;
         } else if row == conn.y + 1 {
-            state.status_message = format!("Reconnecting to {}...", state.announce_url);
+            state.status_message = format!("Reconnecting to producer '{}'...", state.producer_name);
             state.status_msg_time = Some(Instant::now());
             let _ = cmd_tx.send(WorkerCommand::Connect {
-                url: state.announce_url.clone(),
+                name: state.producer_name.clone(),
+                locator: state.zenoh_locator.clone(),
             });
         } else if row == conn.y + 4 {
             state.status_message = "Refreshing scopes...".to_string();
@@ -2253,7 +1973,7 @@ mod tests {
 
     #[test]
     fn test_handle_mouse_click_tabs() {
-        let mut state = AppState::new("tcp://127.0.0.1:5557".to_string());
+        let mut state = AppState::new("imscope".to_string(), None);
         let (tx, _rx) = mpsc::channel();
         let area = Rect::new(0, 0, 180, 24);
 
@@ -2265,7 +1985,7 @@ mod tests {
 
     #[test]
     fn test_handle_mouse_click_spectrum_tab() {
-        let mut state = AppState::new("tcp://127.0.0.1:5557".to_string());
+        let mut state = AppState::new("imscope".to_string(), None);
         let (tx, _rx) = mpsc::channel();
         let area = Rect::new(0, 0, 180, 24);
 
@@ -2278,7 +1998,7 @@ mod tests {
 
     #[test]
     fn test_handle_mouse_click_refresh() {
-        let mut state = AppState::new("tcp://127.0.0.1:5557".to_string());
+        let mut state = AppState::new("imscope".to_string(), None);
         let (tx, rx) = mpsc::channel();
         let area = Rect::new(0, 0, 120, 35);
 

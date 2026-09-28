@@ -24,8 +24,15 @@ use imscope::dsp;
     about = "GUI client for imscope using Dear ImGui + ImPlot"
 )]
 struct Args {
-    #[arg(short, long, default_value = "tcp://127.0.0.1:5557")]
-    announce_url: String,
+    /// Zenoh producer name (the `imscope/<name>/...` key-expression prefix).
+    #[arg(long, default_value = "imscope")]
+    producer: String,
+
+    /// Optional explicit Zenoh locator to connect to (e.g.
+    /// "tcp/127.0.0.1:7447"). If omitted, relies on Zenoh's default
+    /// scouting/discovery.
+    #[arg(long)]
+    zenoh_connect: Option<String>,
 }
 
 // Standard scope Ch1/Ch2-style trace colors, kept consistent across tabs.
@@ -92,7 +99,8 @@ fn render_cursor_readout(ui: &dear_imgui_rs::Ui, pane: &PlotPane, series: &[(&st
 
 struct AppState {
     connection: ConnectionState,
-    announce_url: String,
+    producer_name: String,
+    zenoh_locator: Option<String>,
     panes: [PlotPane; 2],
     num_panes: usize,
     auto_collect_enabled: bool,
@@ -106,10 +114,11 @@ struct AppState {
 }
 
 impl AppState {
-    fn new(announce_url: String) -> Self {
+    fn new(producer_name: String, zenoh_locator: Option<String>) -> Self {
         Self {
             connection: ConnectionState::Disconnected(None),
-            announce_url,
+            producer_name,
+            zenoh_locator,
             panes: [PlotPane::new(), PlotPane::new()],
             num_panes: 1,
             auto_collect_enabled: true,
@@ -143,10 +152,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_worker(cmd_rx, event_tx);
     });
 
-    let mut app_state = AppState::new(args.announce_url.clone());
-    app_state.update_status(format!("Connecting to {}...", args.announce_url));
+    let mut app_state = AppState::new(args.producer.clone(), args.zenoh_connect.clone());
+    app_state.update_status(format!("Connecting to producer '{}'...", args.producer));
     let _ = cmd_tx.send(WorkerCommand::Connect {
-        url: args.announce_url.clone(),
+        name: args.producer.clone(),
+        locator: args.zenoh_connect.clone(),
     });
 
     AppBuilder::new()
@@ -158,7 +168,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match event {
                     WorkerEvent::Connecting => {
                         app_state.connection = ConnectionState::Connecting;
-                        app_state.update_status("Connecting to announcer...".to_string());
+                        app_state.update_status("Connecting to producer...".to_string());
                     }
                     WorkerEvent::Connected {
                         name,
@@ -286,16 +296,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // ─── 1. Control Center Window ───
             ui.window("Control Center")
                 .build(|| {
-                    ui.text("Announce URL Setup");
-                    let mut ann_url = app_state.announce_url.clone();
-                    if ui.input_text("##url", &mut ann_url).build() {
-                        app_state.announce_url = ann_url;
+                    ui.text("Producer Setup");
+                    let mut producer_name = app_state.producer_name.clone();
+                    if ui.input_text("##producer", &mut producer_name).build() {
+                        app_state.producer_name = producer_name;
                     }
                     ui.same_line();
                     if ui.button("Connect") {
-                        app_state.update_status(format!("Connecting to {}...", app_state.announce_url));
+                        app_state.update_status(format!(
+                            "Connecting to producer '{}'...",
+                            app_state.producer_name
+                        ));
                         let _ = cmd_tx_clone.send(WorkerCommand::Connect {
-                            url: app_state.announce_url.clone(),
+                            name: app_state.producer_name.clone(),
+                            locator: app_state.zenoh_locator.clone(),
                         });
                     }
 
@@ -797,7 +811,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // If not connected, show a nice landing/status message in the main area
                 ui.window("Scope View")
                     .build(|| {
-                        ui.text_wrapped("Not connected to announcer. Please check settings and click 'Connect' in the Control Center panel.");
+                        ui.text_wrapped("Not connected to producer. Please check settings and click 'Connect' in the Control Center panel.");
                     });
             }
         })
