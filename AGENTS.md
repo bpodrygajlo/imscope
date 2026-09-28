@@ -41,6 +41,7 @@
 - [CMakeLists.txt](CMakeLists.txt): Root build configuration for C++ modules.
 - [README.md](README.md): General documentation, installation, and usage guide.
 - [.pre-commit-config.yaml](.pre-commit-config.yaml): Code quality checks.
+- [scripts/manual-test-tmux.sh](scripts/manual-test-tmux.sh): Manual smoke test -- builds the project and opens a tmux session with one producer (`imscope-producer-rs`'s `dual_scope` example) and two `imscope-view` consumers on different scopes, side by side.
 
 ## Commit Policy
 - Do not add AI co-authorship trailers (e.g. `Co-Authored-By: Claude ...`) to commit messages or PR descriptions in this repo.

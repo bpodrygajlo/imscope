@@ -138,6 +138,10 @@ several concurrently needs no special setup — just point them at the same `--p
 different `--scope` values. Keys: `1`-`5` switch the displayed plot (Scatter/RMS/
 Waveform/Histogram/Spectrum), `q`/`Esc`/`Ctrl-C` quits.
 
+For a ready-made example of this, `scripts/manual-test-tmux.sh` builds the project and opens a
+tmux session with one producer and two `imscope-view` consumers (each on a different scope)
+side by side.
+
 ---
 
 ## Integrating the Producer API
