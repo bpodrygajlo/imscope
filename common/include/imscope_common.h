@@ -42,6 +42,15 @@ typedef enum {
   SCOPE_TYPE_FLOAT = 3,
 } scope_type_t;
 
+// Whether a scope's samples are raw time-domain data or already
+// frequency-domain (e.g. post-FFT resource-grid symbols from a signal
+// processing pipeline). Consumers use this to decide whether a spectrum
+// view needs to run an FFT or can plot the data directly.
+typedef enum {
+  SCOPE_DOMAIN_TIME = 0,
+  SCOPE_DOMAIN_FREQUENCY = 1,
+} scope_domain_t;
+
 typedef struct {
   NRmetadata meta;
   uint64_t time_taken_in_ns;
@@ -59,6 +68,7 @@ typedef struct {
   char name[MAX_SCOPE_NAME_LEN];
   char group[MAX_GROUP_NAME_LEN];
   scope_type_t type;
+  scope_domain_t domain;
 } imscope_scope_config_t;
 
 typedef struct {

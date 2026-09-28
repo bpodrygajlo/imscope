@@ -23,3 +23,4 @@ ratatui = "0.30.0"
 dear-imgui-rs = "0.14.0"
 dear-implot = "0.14.0"
 dear-app = { version = "0.14.0", features = ["implot"] }
+rustfft = "6"

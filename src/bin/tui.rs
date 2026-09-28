@@ -49,7 +49,8 @@ enum AppTab {
     Rms = 1,
     Waveform = 2,
     Histogram = 3,
-    Settings = 4,
+    Spectrum = 4,
+    Settings = 5,
 }
 
 impl AppTab {
@@ -58,7 +59,8 @@ impl AppTab {
             AppTab::Scatter => AppTab::Rms,
             AppTab::Rms => AppTab::Waveform,
             AppTab::Waveform => AppTab::Histogram,
-            AppTab::Histogram => AppTab::Settings,
+            AppTab::Histogram => AppTab::Spectrum,
+            AppTab::Spectrum => AppTab::Settings,
             AppTab::Settings => AppTab::Scatter,
         }
     }
@@ -69,7 +71,8 @@ impl AppTab {
             AppTab::Rms => AppTab::Scatter,
             AppTab::Waveform => AppTab::Rms,
             AppTab::Histogram => AppTab::Waveform,
-            AppTab::Settings => AppTab::Histogram,
+            AppTab::Spectrum => AppTab::Histogram,
+            AppTab::Settings => AppTab::Spectrum,
         }
     }
 
@@ -545,6 +548,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     app_state.panes[ap].last_active_plot_tab = AppTab::Histogram;
                                 }
                                 KeyCode::Char('5') => {
+                                    app_state.panes[ap].active_tab = AppTab::Spectrum;
+                                    app_state.panes[ap].last_active_plot_tab = AppTab::Spectrum;
+                                }
+                                KeyCode::Char('6') => {
                                     let old_tab = app_state.panes[ap].active_tab;
                                     if old_tab != AppTab::Settings {
                                         app_state.panes[ap].last_active_plot_tab = old_tab;
@@ -677,6 +684,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                                 KeyCode::Char('r') => {
+                                    // "Single": like a hardware scope's Single button, this
+                                    // also stops free-run acquisition if it was running.
+                                    if app_state.auto_collect_enabled {
+                                        app_state.auto_collect_enabled = false;
+                                        let _ = cmd_tx.send(WorkerCommand::SetAutoCollect(false));
+                                    }
                                     let _ = cmd_tx.send(WorkerCommand::RequestSingleFrame);
                                 }
                                 KeyCode::Char('R') => {
@@ -1419,12 +1432,20 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
         ])
         .split(area);
 
-    // Determine scope type for the current pane's selection
+    // Determine scope type/domain for the current pane's selection
     let active_scope_type_for_meta =
         if let ConnectionState::Connected { ref scopes, .. } = state.connection {
             scopes
                 .get(state.panes[pane_idx].selected_scope_idx)
                 .map(|s| s.scope_type)
+        } else {
+            None
+        };
+    let active_scope_domain_for_meta =
+        if let ConnectionState::Connected { ref scopes, .. } = state.connection {
+            scopes
+                .get(state.panes[pane_idx].selected_scope_idx)
+                .map(|s| s.domain)
         } else {
             None
         };
@@ -1435,7 +1456,8 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
         "2. RMS Power (IQ only)",
         "3. Waveform",
         "4. Histogram",
-        "5. Settings",
+        "5. Spectrum",
+        "6. Settings",
     ];
     let tab_style = Style::default().fg(Color::White);
     let selected_style = Style::default()
@@ -1488,9 +1510,9 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
         }
 
         match display_tab {
-            AppTab::Scatter | AppTab::Rms => {
+            AppTab::Scatter | AppTab::Rms | AppTab::Spectrum => {
                 let msg = Paragraph::new(
-                    "\n\nScatter and RMS Power plots are not available for grouped scopes.",
+                    "\n\nScatter, RMS Power, and Spectrum plots are not available for grouped scopes.",
                 )
                 .alignment(Alignment::Center)
                 .fg(Color::Yellow)
@@ -1812,6 +1834,51 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
                         .label_style(Style::default().fg(Color::Gray));
                     frame.render_widget(chart, chunks[1]);
                 }
+                AppTab::Spectrum => {
+                    let domain =
+                        active_scope_domain_for_meta.unwrap_or(consumer::ScopeDomain::Time);
+                    let spectrum =
+                        imscope::dsp::compute_spectrum_db(&snapshot.real, &snapshot.imag, domain);
+                    if spectrum.is_empty() {
+                        let msg = Paragraph::new("\n\nNo signal data received yet.")
+                            .alignment(Alignment::Center)
+                            .fg(Color::DarkGray)
+                            .block(plot_block);
+                        frame.render_widget(msg, chunks[1]);
+                    } else {
+                        let y_lo = spectrum.iter().cloned().fold(f64::MAX, f64::min);
+                        let y_hi = spectrum
+                            .iter()
+                            .cloned()
+                            .fold(f64::MIN, f64::max)
+                            .max(y_lo + 1.0);
+                        let num_bins = spectrum.len();
+                        let domain_label = match domain {
+                            consumer::ScopeDomain::Time => "FFT, Hann window",
+                            consumer::ScopeDomain::Frequency => "direct, already freq-domain",
+                        };
+                        let canvas = Canvas::default()
+                            .block(plot_block.title(format!(
+                                " Spectrum [{}] (dB vs. frequency bin) ",
+                                domain_label
+                            )))
+                            .x_bounds([0.0, num_bins as f64])
+                            .y_bounds([y_lo, y_hi])
+                            .paint(move |ctx| {
+                                let step = (num_bins / 500).max(1);
+                                for i in (0..num_bins.saturating_sub(step)).step_by(step) {
+                                    ctx.draw(&ratatui::widgets::canvas::Line {
+                                        x1: i as f64,
+                                        y1: spectrum[i],
+                                        x2: (i + step) as f64,
+                                        y2: spectrum[i + step],
+                                        color: Color::Cyan,
+                                    });
+                                }
+                            });
+                        frame.render_widget(canvas, chunks[1]);
+                    }
+                }
                 AppTab::Settings => unreachable!(),
             }
         }
@@ -1892,6 +1959,11 @@ fn draw_plot_area(frame: &mut Frame, area: Rect, state: &mut AppState, pane_idx:
                 Span::raw("   Total stacked: "),
                 Span::styled(
                     format!("{}", snapshot.size()),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw("   RMS Power: "),
+                Span::styled(
+                    format!("{:.2}", consumer::rms_power(&snapshot.power)),
                     Style::default().fg(Color::Green),
                 ),
             ]),
@@ -2061,11 +2133,17 @@ fn handle_mouse_click(
                     if let Some(ref mut s) = state.panes[ap].active_snapshot {
                         s.max_stacked_size = sz;
                     }
+                    for s in state.panes[ap].group_snapshots.values_mut() {
+                        s.max_stacked_size = sz;
+                    }
                 } else if relative_col >= 28 && relative_col <= 32 {
                     state.panes[ap].stacking_size =
                         (state.panes[ap].stacking_size + 1000).min(100000);
                     let sz = state.panes[ap].stacking_size;
                     if let Some(ref mut s) = state.panes[ap].active_snapshot {
+                        s.max_stacked_size = sz;
+                    }
+                    for s in state.panes[ap].group_snapshots.values_mut() {
                         s.max_stacked_size = sz;
                     }
                 }
@@ -2139,6 +2217,8 @@ fn handle_mouse_click(
                 AppTab::Waveform
             } else if relative_col < 67 {
                 AppTab::Histogram
+            } else if relative_col < 79 {
+                AppTab::Spectrum
             } else {
                 AppTab::Settings
             };
@@ -2181,6 +2261,19 @@ mod tests {
         // Waveform is relative_col=45, so col=42+1+45=88, row=2+1=3
         handle_mouse_click(88, 3, area, &mut state, &tx);
         assert_eq!(state.panes[0].active_tab, AppTab::Waveform);
+    }
+
+    #[test]
+    fn test_handle_mouse_click_spectrum_tab() {
+        let mut state = AppState::new("tcp://127.0.0.1:5557".to_string());
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(0, 0, 180, 24);
+
+        // Spectrum spans relative_col [67, 79); use 70, so col=42+1+70=113.
+        handle_mouse_click(113, 3, area, &mut state, &tx);
+        assert_eq!(state.panes[0].active_tab, AppTab::Spectrum);
+        // Not Settings, so it must have updated last_active_plot_tab too.
+        assert_eq!(state.panes[0].last_active_plot_tab, AppTab::Spectrum);
     }
 
     #[test]
