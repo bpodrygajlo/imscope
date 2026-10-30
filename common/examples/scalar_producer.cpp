@@ -23,12 +23,10 @@ int main() {
   spdlog::set_level(spdlog::level::info);
 
   std::cout << "Starting scalar producer example..." << std::endl;
-  std::cout << "Connect a consumer to producer name 'scalar_example'" << std::endl;
+  std::cout << "Connect the TUI to tcp://127.0.0.1:5557" << std::endl;
 
-  // `data_address` is deprecated/unused; the second parameter is now an
-  // optional Zenoh locator to explicitly connect to -- "" relies on Zenoh's
-  // default scouting/discovery instead.
-  imscope_init_producer("", "", "scalar_example", nullptr, 0);
+  imscope_init_producer("tcp://127.0.0.1:5556", "tcp://127.0.0.1:5557",
+                        "scalar_example", nullptr, 0);
 
   double phase = 0.0;
   int32_t harq_retx = 0;

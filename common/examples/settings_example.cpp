@@ -43,11 +43,10 @@ int main() {
 
   std::cout << "Starting ControlledWave (Settings Example)..." << std::endl;
 
-  // 1. Initialize the producer. `data_address` is deprecated/unused; the
-  // second parameter is now an optional Zenoh locator to explicitly connect
-  // to -- "" relies on Zenoh's default scouting/discovery instead.
+  // 1. Initialize the producer
   imscope_return_t ret =
-      imscope_init_producer("", "", "settings_example", scopes, 1);
+      imscope_init_producer("tcp://127.0.0.1:5556", "tcp://127.0.0.1:5557",
+                            "settings_example", scopes, 1);
   if (ret != IMSCOPE_SUCCESS) {
     spdlog::error("Failed to initialize producer");
     return 1;

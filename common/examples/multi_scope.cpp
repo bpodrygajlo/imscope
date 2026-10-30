@@ -23,10 +23,8 @@ int main() {
   };
 
   std::cout << "Initializing producer with 2 scopes..." << std::endl;
-  // `data_address` is deprecated/unused; the second parameter is now an
-  // optional Zenoh locator to explicitly connect to -- "" relies on Zenoh's
-  // default scouting/discovery instead.
-  imscope_init_producer("", "", "multi_scope_example", scopes, 2);
+  imscope_init_producer("tcp://127.0.0.1:5556", "tcp://127.0.0.1:5557",
+                        "multi_scope_example", scopes, 2);
 
   std::random_device rd;
   std::mt19937 gen(rd());

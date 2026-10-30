@@ -5,8 +5,11 @@
  * See LICENSE file in the project root for full license information.
  */
 
-#include <zenoh.hxx>
+#include <nng/nng.h>
+#include <nng/protocol/reqrep0/rep.h>
+#include <nng/protocol/reqrep0/req.h>
 #include "imscope_common.h"
+#include "imscope_discovery.h"
 #include "imscope_internal.h"
 
 #include <spdlog/spdlog.h>
@@ -15,13 +18,29 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
-#include <optional>
+#include <queue>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "imscope_producer.h"
+
+static std::string derive_control_address(const std::string& announce_addr) {
+  if (announce_addr.rfind("tcp://", 0) == 0) {
+    size_t colon = announce_addr.rfind(':');
+    if (colon != std::string::npos) {
+      std::string port_str = announce_addr.substr(colon + 1);
+      try {
+        int port = std::stoi(port_str);
+        return announce_addr.substr(0, colon + 1) + std::to_string(port + 1);
+      } catch (...) {
+        // Fallback
+      }
+    }
+  }
+  return announce_addr + "-control";
+}
 
 // Settings are serialized on the wire in a fixed 64-byte name field
 // (imscope_setting_t::name / setting_request_t::name). Truncate to that
@@ -58,42 +77,266 @@ typedef struct {
   scope_domain_t domain = SCOPE_DOMAIN_TIME;
 } scope_info_t;
 
-// A producer using Zenoh instead of NNG. The general shape mirrors the
-// NNG-based `ImscopeProducer` this replaces (and the Rust `Producer` in
-// `producer/src/producer.rs`): one `zenoh::Session`, a `Queryable` each for
-// the announce and control key expressions (which reply synchronously
-// inside the callback), and one data `Queryable` per scope which instead
-// clones and parks the `Query` in `active_requests` until a `try_send_*`
-// call claims and replies to it. Compared to the old NNG worker-context
-// pool (`ScopeCtx`/`AnnounceCtx`/`SettingsCtx`, each wrapping an `nng_ctx` +
-// `nng_aio` pair that had to be manually re-armed with `nng_ctx_recv` after
-// every request), a Zenoh `Queryable` callback simply fires again for every
-// subsequent query with no re-arming needed, so the "worker pool" concept
-// disappears entirely.
 class ImscopeProducer {
+  std::string data_address;
+  std::string announce_address;
   std::string name;
-  std::string data_key_prefix;
-  std::string control_key;
-
-  std::optional<zenoh::Session> session;
+  nng_socket announce_socket = NNG_SOCKET_INITIALIZER;
 
   std::vector<scope_info_t> configured_scopes;
-  std::mutex scopes_mutex;
 
-  // Queries parked here are waiting for a `try_send_*`/`commit_buffer` call
-  // to claim and reply to them -- the direct analog of the NNG version's
-  // `active_requests` map of `ScopeCtx*`, and of the Rust producer's
-  // `Mutex<HashMap<i32, PendingSlot>>` (`producer/src/producer.rs`).
-  std::unordered_map<int, zenoh::Query> active_requests;
+  nng_socket data_socket = NNG_SOCKET_INITIALIZER;
+
+  struct ScopeCtx {
+    nng_ctx ctx;
+    nng_aio* send_aio;
+    nng_aio* recv_aio;
+    std::atomic<bool> req_received;
+    ImscopeProducer* parent;
+    int id;
+
+    ScopeCtx(nng_socket socket, ImscopeProducer* p)
+        : parent(p), id(-1), req_received(false) {
+      nng_ctx_open(&ctx, socket);
+      nng_aio_alloc(&send_aio, NULL, NULL);
+      nng_aio_alloc(&recv_aio, recv_callback, this);
+      // Start waiting for the first request
+      nng_ctx_recv(ctx, recv_aio);
+    }
+
+    ~ScopeCtx() {
+      nng_aio_free(send_aio);
+      nng_aio_free(recv_aio);
+      nng_ctx_close(ctx);
+    }
+
+    static void recv_callback(void* arg) {
+      auto self = static_cast<ScopeCtx*>(arg);
+      int rv = nng_aio_result(self->recv_aio);
+      if (rv == 0) {
+        nng_msg* msg = nng_aio_get_msg(self->recv_aio);
+        if (nng_msg_len(msg) >= sizeof(scope_request_t)) {
+          scope_request_t* req = (scope_request_t*)nng_msg_body(msg);
+          if (req->magic == SCOPE_REQ_MSG_ID) {
+            self->id = req->scope_id;
+            std::lock_guard<std::mutex> lock(
+                self->parent->active_requests_mutex);
+            self->parent->active_requests[self->id].push_back(self);
+            self->req_received.store(true);
+            return;  // Don't restart recv yet, wait for send
+          }
+        }
+        // If message is invalid, just restart recv
+        nng_msg_free(msg);
+        nng_ctx_recv(self->ctx, self->recv_aio);
+      } else if (rv != (int)NNG_ECLOSED) {
+        // Restart on error
+        nng_ctx_recv(self->ctx, self->recv_aio);
+      }
+    }
+  };
+
+  struct AnnounceCtx {
+    nng_ctx ctx;
+    nng_aio* send_aio;
+    nng_aio* recv_aio;
+    ImscopeProducer* parent;
+
+    AnnounceCtx(nng_socket socket, ImscopeProducer* p) : parent(p) {
+      nng_ctx_open(&ctx, socket);
+      nng_aio_alloc(&send_aio, NULL, NULL);
+      nng_aio_alloc(&recv_aio, announce_callback, this);
+      // Start waiting for the first announce request
+      nng_ctx_recv(ctx, recv_aio);
+    }
+
+    ~AnnounceCtx() {
+      nng_aio_free(send_aio);
+      nng_aio_free(recv_aio);
+      nng_ctx_close(ctx);
+    }
+
+    static void announce_callback(void* arg) {
+      auto self = static_cast<AnnounceCtx*>(arg);
+      int rv = nng_aio_result(self->recv_aio);
+      if (rv == 0) {
+        nng_msg* req_msg = nng_aio_get_msg(self->recv_aio);
+        if (nng_msg_len(req_msg) >= sizeof(announce_request_t)) {
+          announce_request_t* req = (announce_request_t*)nng_msg_body(req_msg);
+          if (req->magic == ANNOUNCE_MSG_ID) {
+            std::lock_guard<std::mutex> lock(self->parent->scopes_mutex);
+            size_t size = sizeof(announce_response_t) +
+                          self->parent->configured_scopes.size() *
+                              sizeof(imscope_scope_config_t);
+
+            nng_msg* res_msg;
+            nng_msg_alloc(&res_msg, size);
+
+            // Prepare protocol description
+            announce_response_t* msg =
+                (announce_response_t*)nng_msg_body(res_msg);
+            msg->num_scopes = self->parent->configured_scopes.size();
+            strncpy(msg->data_address, self->parent->data_address.c_str(),
+                    sizeof(msg->data_address) - 1);
+            strncpy(msg->control_address, self->parent->control_address.c_str(),
+                    sizeof(msg->control_address) - 1);
+            strncpy(msg->name, self->parent->name.c_str(),
+                    sizeof(msg->name) - 1);
+            for (size_t i = 0; i < self->parent->configured_scopes.size();
+                 i++) {
+              strncpy(msg->scopes[i].name,
+                      self->parent->configured_scopes[i].name.c_str(),
+                      MAX_SCOPE_NAME_LEN - 1);
+              strncpy(msg->scopes[i].group,
+                      self->parent->configured_scopes[i].group.c_str(),
+                      MAX_GROUP_NAME_LEN - 1);
+              msg->scopes[i].type = self->parent->configured_scopes[i].type;
+              msg->scopes[i].domain = self->parent->configured_scopes[i].domain;
+            }
+
+            spdlog::debug(
+                "ImscopeProducer: Announced {} scopes to consumer."
+                "Data address: {} Announce address: {} Control address: {}",
+                self->parent->configured_scopes.size(),
+                self->parent->data_address, self->parent->announce_address,
+                self->parent->control_address);
+
+            // Send response asynchronously
+            nng_aio_set_msg(self->send_aio, res_msg);
+            nng_ctx_send(self->ctx, self->send_aio);
+          }
+        }
+        nng_msg_free(req_msg);
+        nng_ctx_recv(self->ctx, self->recv_aio);
+      } else if (rv != (int)NNG_ECLOSED) {
+        // Restart on error
+        nng_ctx_recv(self->ctx, self->recv_aio);
+      }
+    }
+  };
+
+  struct SettingsCtx {
+    nng_ctx ctx;
+    nng_aio* send_aio;
+    nng_aio* recv_aio;
+    ImscopeProducer* parent;
+
+    SettingsCtx(nng_socket socket, ImscopeProducer* p) : parent(p) {
+      nng_ctx_open(&ctx, socket);
+      nng_aio_alloc(&send_aio, NULL, NULL);
+      nng_aio_alloc(&recv_aio, settings_callback, this);
+      nng_ctx_recv(ctx, recv_aio);
+    }
+
+    ~SettingsCtx() {
+      nng_aio_free(send_aio);
+      nng_aio_free(recv_aio);
+      nng_ctx_close(ctx);
+    }
+
+    static void settings_callback(void* arg) {
+      auto self = static_cast<SettingsCtx*>(arg);
+      int rv = nng_aio_result(self->recv_aio);
+      if (rv == 0) {
+        nng_msg* req_msg = nng_aio_get_msg(self->recv_aio);
+        if (nng_msg_len(req_msg) >= sizeof(setting_request_t)) {
+          setting_request_t* req = (setting_request_t*)nng_msg_body(req_msg);
+          if (req->magic == SETTING_REQ_GET_ALL) {
+            std::lock_guard<std::mutex> lock(self->parent->settings_mutex);
+            size_t num_settings = self->parent->registered_settings.size();
+            size_t size = sizeof(setting_response_t);
+            if (num_settings > 1) {
+              size += (num_settings - 1) * sizeof(imscope_setting_t);
+            } else if (num_settings == 0) {
+              size -= sizeof(imscope_setting_t);
+            }
+            nng_msg* res_msg;
+            nng_msg_alloc(&res_msg, size);
+            setting_response_t* res =
+                (setting_response_t*)nng_msg_body(res_msg);
+            res->magic = SETTING_REP_GET_ALL;
+            res->status = 0;
+            res->num_settings = num_settings;
+            for (size_t i = 0; i < num_settings; i++) {
+              const auto& s = self->parent->registered_settings[i];
+              strncpy(res->settings[i].name, s.name.c_str(),
+                      sizeof(res->settings[i].name) - 1);
+              res->settings[i].name[sizeof(res->settings[i].name) - 1] = '\0';
+              res->settings[i].type = s.type;
+              if (s.type == SETTING_TYPE_BOOL) {
+                res->settings[i].value.bval = s.value.bval ? 1 : 0;
+              } else if (s.type == SETTING_TYPE_INT32) {
+                res->settings[i].value.ival = s.value.ival;
+              } else if (s.type == SETTING_TYPE_FLOAT) {
+                res->settings[i].value.fval = s.value.fval;
+              }
+            }
+            nng_aio_set_msg(self->send_aio, res_msg);
+            nng_ctx_send(self->ctx, self->send_aio);
+          } else if (req->magic == SETTING_REQ_SET) {
+            std::lock_guard<std::mutex> lock(self->parent->settings_mutex);
+            bool found = false;
+            int status = -1;
+            for (auto& s : self->parent->registered_settings) {
+              if (strncmp(s.name.c_str(), req->name, sizeof(req->name)) == 0) {
+                found = true;
+                if (s.type == req->type) {
+                  if (s.type == SETTING_TYPE_BOOL) {
+                    s.value.bval = req->value.bval != 0;
+                    if (s.bool_cb)
+                      s.bool_cb(s.value.bval);
+                  } else if (s.type == SETTING_TYPE_INT32) {
+                    s.value.ival = req->value.ival;
+                    if (s.int32_cb)
+                      s.int32_cb(s.value.ival);
+                  } else if (s.type == SETTING_TYPE_FLOAT) {
+                    s.value.fval = req->value.fval;
+                    if (s.float_cb)
+                      s.float_cb(s.value.fval);
+                  }
+                  status = 0;
+                } else {
+                  status = -2;  // type mismatch
+                }
+                break;
+              }
+            }
+            if (!found) {
+              status = -3;  // not found
+            }
+            nng_msg* res_msg;
+            nng_msg_alloc(&res_msg, sizeof(setting_response_t) -
+                                        sizeof(imscope_setting_t));
+            setting_response_t* res =
+                (setting_response_t*)nng_msg_body(res_msg);
+            res->magic = SETTING_REP_SET;
+            res->status = status;
+            res->num_settings = 0;
+            nng_aio_set_msg(self->send_aio, res_msg);
+            nng_ctx_send(self->ctx, self->send_aio);
+          }
+        }
+        nng_msg_free(req_msg);
+        nng_ctx_recv(self->ctx, self->recv_aio);
+      } else if (rv != (int)NNG_ECLOSED) {
+        nng_ctx_recv(self->ctx, self->recv_aio);
+      }
+    }
+  };
+
+  std::vector<std::unique_ptr<ScopeCtx>> workers;
+  std::unique_ptr<AnnounceCtx> announce_handler;
+  std::unique_ptr<SettingsCtx> settings_handler;
+  std::unordered_map<int, std::vector<ScopeCtx*>> active_requests;
   std::mutex active_requests_mutex;
-
-  // Buffers acquired via `acquire_buffer()` for zero-copy sends, keyed by
-  // scope id, claimed and sent by a later `commit_buffer()` call.
-  std::unordered_map<int, std::vector<uint8_t>> acquired_buffers;
-  std::mutex acquired_buffers_mutex;
+  std::mutex scopes_mutex;
+  std::mutex acquired_msgs_mutex;
 
   std::mutex settings_mutex;
   std::vector<SettingInfo> registered_settings;
+  std::string control_address;
+  nng_socket control_socket = NNG_SOCKET_INITIALIZER;
+  void* discovery_server_handle = nullptr;
 
   std::mutex scalar_mutex;
   std::thread flush_thread;
@@ -108,261 +351,86 @@ class ImscopeProducer {
 
   std::unordered_map<int, ScalarAccumulator> scalar_accumulators;
 
-  // Declares the data `Queryable` for `scope_id` (key expression
-  // `imscope/<name>/data/<scope_id>`), if a session is currently open.
-  // Called both for the scopes configured at `connect()` time and for
-  // scopes registered dynamically afterwards (`add_scope`/
-  // `get_or_register_scope`). A `declare_background_queryable` answers
-  // until the session itself is closed/destroyed, so nothing needs to be
-  // kept alive to hold it open -- unlike the NNG version's `workers` vector
-  // of `ScopeCtx` objects.
-  void declare_data_queryable(int scope_id) {
-    if (!session.has_value()) {
-      return;
-    }
-    std::string key = data_key_prefix + "/" + std::to_string(scope_id);
-    try {
-      session->declare_background_queryable(
-          key, [this](zenoh::Query& query) { handle_data_query(query); },
-          []() {});
-    } catch (const zenoh::ZException& e) {
-      spdlog::error(
-          "ImscopeProducer: failed to declare data queryable for scope {} "
-          "(key '{}'): {}",
-          scope_id, key, e.what());
-    }
-  }
-
-  // On a valid scope data request, clones the `Query` and parks it in
-  // `active_requests` keyed by the requested scope id, instead of replying
-  // immediately -- the reply is sent later by `send_scope_data()` /
-  // `commit_buffer()` / `send_accumulator_locked()`, once the application
-  // has actual sample data to hand back. If nothing ever sends for this
-  // scope, the `Query` is simply dropped (replaced by the next request, or
-  // dropped along with the producer) and the requester's `get()` times out
-  // -- the same drop-if-nobody-produces semantics the NNG version had.
-  void handle_data_query(zenoh::Query& query) {
-    auto payload = query.get_payload();
-    if (!payload.has_value()) {
-      return;
-    }
-    std::vector<uint8_t> bytes = payload->get().as_vector();
-    if (bytes.size() < sizeof(scope_request_t)) {
-      return;
-    }
-    scope_request_t req;
-    std::memcpy(&req, bytes.data(), sizeof(req));
-    if (req.magic != SCOPE_REQ_MSG_ID) {
-      return;
-    }
-
-    zenoh::Query cloned = query.clone();
-    std::lock_guard<std::mutex> lock(active_requests_mutex);
-    active_requests.insert_or_assign(req.scope_id, std::move(cloned));
-  }
-
-  // Replies synchronously to an announce request, mirroring the NNG
-  // version's `AnnounceCtx::announce_callback`.
-  void handle_announce_query(zenoh::Query& query) {
-    auto payload = query.get_payload();
-    if (!payload.has_value()) {
-      return;
-    }
-    std::vector<uint8_t> req_bytes = payload->get().as_vector();
-    if (req_bytes.size() < sizeof(announce_request_t)) {
-      return;
-    }
-    announce_request_t req;
-    std::memcpy(&req, req_bytes.data(), sizeof(req));
-    if (req.magic != ANNOUNCE_MSG_ID) {
-      return;
-    }
-
-    std::vector<uint8_t> reply_bytes;
-    size_t num_scopes = 0;
-    {
-      std::lock_guard<std::mutex> lock(scopes_mutex);
-      num_scopes = configured_scopes.size();
-      size_t size =
-          sizeof(announce_response_t) + num_scopes * sizeof(imscope_scope_config_t);
-      reply_bytes.assign(size, 0);
-      announce_response_t* msg =
-          reinterpret_cast<announce_response_t*>(reply_bytes.data());
-      msg->num_scopes = static_cast<int>(num_scopes);
-      std::strncpy(msg->data_address, data_key_prefix.c_str(),
-                   sizeof(msg->data_address) - 1);
-      std::strncpy(msg->control_address, control_key.c_str(),
-                   sizeof(msg->control_address) - 1);
-      std::strncpy(msg->name, name.c_str(), sizeof(msg->name) - 1);
-      for (size_t i = 0; i < num_scopes; i++) {
-        std::strncpy(msg->scopes[i].name, configured_scopes[i].name.c_str(),
-                     MAX_SCOPE_NAME_LEN - 1);
-        std::strncpy(msg->scopes[i].group, configured_scopes[i].group.c_str(),
-                     MAX_GROUP_NAME_LEN - 1);
-        msg->scopes[i].type = configured_scopes[i].type;
-        msg->scopes[i].domain = configured_scopes[i].domain;
-      }
-    }
-
-    spdlog::debug(
-        "ImscopeProducer: announced {} scopes to consumer. Data key: {} "
-        "Control key: {}",
-        num_scopes, data_key_prefix, control_key);
-
-    try {
-      query.reply(query.get_keyexpr(), zenoh::Bytes(std::move(reply_bytes)));
-    } catch (const zenoh::ZException& e) {
-      spdlog::error("ImscopeProducer: failed to reply to announce query: {}",
-                    e.what());
-    }
-  }
-
-  // Replies synchronously to a settings get-all/set request, mirroring the
-  // NNG version's `SettingsCtx::settings_callback`. Settings ARE
-  // implemented here (unlike the Rust producer crate's stub), reusing the
-  // existing `SettingInfo`/`registered_settings` registry -- only the
-  // transport call that reads the request and writes the reply changed.
-  void handle_control_query(zenoh::Query& query) {
-    auto payload = query.get_payload();
-    if (!payload.has_value()) {
-      return;
-    }
-    std::vector<uint8_t> req_bytes = payload->get().as_vector();
-    if (req_bytes.size() < sizeof(setting_request_t)) {
-      return;
-    }
-    setting_request_t req;
-    std::memcpy(&req, req_bytes.data(), sizeof(req));
-
-    std::vector<uint8_t> reply_bytes;
-    if (req.magic == SETTING_REQ_GET_ALL) {
-      std::lock_guard<std::mutex> lock(settings_mutex);
-      size_t num_settings = registered_settings.size();
-      size_t size = sizeof(setting_response_t);
-      if (num_settings > 1) {
-        size += (num_settings - 1) * sizeof(imscope_setting_t);
-      } else if (num_settings == 0) {
-        size -= sizeof(imscope_setting_t);
-      }
-      reply_bytes.assign(size, 0);
-      setting_response_t* res =
-          reinterpret_cast<setting_response_t*>(reply_bytes.data());
-      res->magic = SETTING_REP_GET_ALL;
-      res->status = 0;
-      res->num_settings = static_cast<int32_t>(num_settings);
-      for (size_t i = 0; i < num_settings; i++) {
-        const auto& s = registered_settings[i];
-        std::strncpy(res->settings[i].name, s.name.c_str(),
-                     sizeof(res->settings[i].name) - 1);
-        res->settings[i].name[sizeof(res->settings[i].name) - 1] = '\0';
-        res->settings[i].type = s.type;
-        if (s.type == SETTING_TYPE_BOOL) {
-          res->settings[i].value.bval = s.value.bval ? 1 : 0;
-        } else if (s.type == SETTING_TYPE_INT32) {
-          res->settings[i].value.ival = s.value.ival;
-        } else if (s.type == SETTING_TYPE_FLOAT) {
-          res->settings[i].value.fval = s.value.fval;
-        }
-      }
-    } else if (req.magic == SETTING_REQ_SET) {
-      std::lock_guard<std::mutex> lock(settings_mutex);
-      bool found = false;
-      int32_t status = -1;
-      for (auto& s : registered_settings) {
-        if (strncmp(s.name.c_str(), req.name, sizeof(req.name)) == 0) {
-          found = true;
-          if (s.type == req.type) {
-            if (s.type == SETTING_TYPE_BOOL) {
-              s.value.bval = req.value.bval != 0;
-              if (s.bool_cb)
-                s.bool_cb(s.value.bval);
-            } else if (s.type == SETTING_TYPE_INT32) {
-              s.value.ival = req.value.ival;
-              if (s.int32_cb)
-                s.int32_cb(s.value.ival);
-            } else if (s.type == SETTING_TYPE_FLOAT) {
-              s.value.fval = req.value.fval;
-              if (s.float_cb)
-                s.float_cb(s.value.fval);
-            }
-            status = 0;
-          } else {
-            status = -2;  // type mismatch
-          }
-          break;
-        }
-      }
-      if (!found) {
-        status = -3;  // not found
-      }
-      reply_bytes.assign(sizeof(setting_response_t) - sizeof(imscope_setting_t),
-                          0);
-      setting_response_t* res =
-          reinterpret_cast<setting_response_t*>(reply_bytes.data());
-      res->magic = SETTING_REP_SET;
-      res->status = status;
-      res->num_settings = 0;
-    } else {
-      // Unrecognized request: drop it, the requester's `get()` eventually
-      // times out.
-      return;
-    }
-
-    try {
-      query.reply(query.get_keyexpr(), zenoh::Bytes(std::move(reply_bytes)));
-    } catch (const zenoh::ZException& e) {
-      spdlog::error("ImscopeProducer: failed to reply to control query: {}",
-                    e.what());
-    }
-  }
-
  public:
-  // Sends the accumulated scalar buffer for `id` and clears it. Returns
-  // IMSCOPE_SUCCESS even if no consumer is currently waiting on this scope
-  // (the buffer stays queued for later).
+  // Sends the accumulated scalar buffer for `id` and clears it. Caller must
+  // already hold scalar_mutex. Returns IMSCOPE_SUCCESS even if no worker is
+  // currently waiting on this scope (the buffer stays queued for later).
   imscope_return_t send_accumulator_locked(
       int id, ScalarAccumulator& acc,
       std::chrono::steady_clock::time_point now) {
-    std::optional<zenoh::Query> query;
+    std::vector<ScopeCtx*> waiting;
     {
-      std::lock_guard<std::mutex> lock(active_requests_mutex);
+      std::lock_guard<std::mutex> active_lock(active_requests_mutex);
       auto it = active_requests.find(id);
-      if (it == active_requests.end()) {
-        return IMSCOPE_SUCCESS;
+      if (it != active_requests.end()) {
+        waiting = std::move(it->second);
+        active_requests.erase(it);
       }
-      query.emplace(std::move(it->second));
-      active_requests.erase(it);
+    }
+    if (waiting.empty()) {
+      return IMSCOPE_SUCCESS;
     }
 
     auto start = std::chrono::high_resolution_clock::now();
     size_t size = sizeof(scope_msg_t) + sizeof(uint32_t) * acc.buffer.size();
-    std::vector<uint8_t> bytes(size, 0);
-    scope_msg_t* msg = reinterpret_cast<scope_msg_t*>(bytes.data());
+    nng_msg* base_msg = nullptr;
+    if (nng_msg_alloc(&base_msg, size) != 0) {
+      for (auto* worker : waiting) {
+        worker->req_received.store(false);
+        nng_msg* req_msg = nng_aio_get_msg(worker->recv_aio);
+        if (req_msg)
+          nng_msg_free(req_msg);
+        nng_ctx_recv(worker->ctx, worker->recv_aio);
+      }
+      return IMSCOPE_ERROR_INTERNAL;
+    }
+
+    scope_msg_t* msg = (scope_msg_t*)nng_msg_body(base_msg);
     msg->meta = {};
     msg->id = id;
     msg->data_size = acc.buffer.size() * sizeof(uint32_t);
-    std::memcpy((void*)(msg + 1), acc.buffer.data(),
-                sizeof(uint32_t) * acc.buffer.size());
+    memcpy((void*)(msg + 1), acc.buffer.data(),
+           sizeof(uint32_t) * acc.buffer.size());
     msg->time_taken_in_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::high_resolution_clock::now() - start)
             .count();
 
-    imscope_return_t result = IMSCOPE_SUCCESS;
-    try {
-      query->reply(query->get_keyexpr(), zenoh::Bytes(std::move(bytes)));
-    } catch (const zenoh::ZException& e) {
-      spdlog::error(
-          "ImscopeProducer: failed to reply scalar accumulator for scope "
-          "{}: {}",
-          id, e.what());
-      result = IMSCOPE_ERROR_INTERNAL;
+    for (size_t i = 0; i < waiting.size(); i++) {
+      ScopeCtx* worker = waiting[i];
+      worker->req_received.store(false);
+      nng_msg* req_msg = nng_aio_get_msg(worker->recv_aio);
+      if (req_msg) {
+        nng_msg_free(req_msg);
+      }
+
+      nng_msg* msg_to_send = nullptr;
+      if (i == waiting.size() - 1) {
+        msg_to_send = base_msg;
+      } else {
+        if (nng_msg_dup(&msg_to_send, base_msg) != 0) {
+          continue;
+        }
+      }
+
+      nng_aio_set_msg(worker->send_aio, msg_to_send);
+      nng_ctx_send(worker->ctx, worker->send_aio);
+    }
+
+    int last_rv = 0;
+    for (auto* worker : waiting) {
+      nng_aio_wait(worker->send_aio);
+      int rv = nng_aio_result(worker->send_aio);
+      if (rv != 0) {
+        last_rv = rv;
+      }
+      nng_ctx_recv(worker->ctx, worker->recv_aio);
     }
 
     acc.buffer.clear();
     acc.last_send_time = now;
 
-    return result;
+    return last_rv == 0 ? IMSCOPE_SUCCESS : IMSCOPE_ERROR_INTERNAL;
   }
 
   imscope_return_t push_scalar_value(uint32_t val, int id) {
@@ -487,13 +555,75 @@ class ImscopeProducer {
     return IMSCOPE_SUCCESS;
   }
 
+  static int bind_socket_url(nng_socket socket, const std::string& address,
+                             std::string& out_advertised_url) {
+    std::string bind_address = address;
+    if (bind_address.empty()) {
+      bind_address = "tcp://0.0.0.0:0";
+    }
+
+    nng_listener listener;
+    int rv = nng_listener_create(&listener, socket, bind_address.c_str());
+    if (rv != 0) {
+      return rv;
+    }
+    rv = nng_listener_start(listener, 0);
+    if (rv != 0) {
+      nng_listener_close(listener);
+      return rv;
+    }
+
+    int port = 0;
+    if (nng_listener_get_int(listener, NNG_OPT_TCP_BOUND_PORT, &port) == 0 &&
+        port > 0) {
+      std::string ip = "127.0.0.1";
+      if (bind_address.find("0.0.0.0") != std::string::npos) {
+        ip = imscope_get_primary_ip();
+      } else {
+        size_t prefix = bind_address.find("://");
+        if (prefix != std::string::npos) {
+          size_t start = prefix + 3;
+          size_t colon = bind_address.rfind(':');
+          if (colon != std::string::npos && colon > start) {
+            ip = bind_address.substr(start, colon - start);
+          }
+        }
+      }
+      out_advertised_url = "tcp://" + ip + ":" + std::to_string(port);
+    } else {
+      out_advertised_url = bind_address;
+    }
+    return 0;
+  }
+
   ImscopeProducer() {}
 
   ~ImscopeProducer() {
     stop_flush_thread();
-    // Dropping the session undeclares all of its background queryables
-    // (announce, control, and every scope's data queryable).
-    session.reset();
+    if (discovery_server_handle) {
+      imscope_discovery_server_stop(discovery_server_handle);
+      discovery_server_handle = nullptr;
+    }
+    announce_handler.reset();
+    settings_handler.reset();
+    if (nng_socket_id(announce_socket) > 0) {
+      nng_close(announce_socket);
+    }
+    if (nng_socket_id(control_socket) > 0) {
+      nng_close(control_socket);
+    }
+    {
+      std::lock_guard<std::mutex> lock(active_requests_mutex);
+      active_requests.clear();
+    }
+    workers.clear();
+    if (nng_socket_id(data_socket) > 0) {
+      nng_close(data_socket);
+    }
+    for (auto& pair : acquired_msgs) {
+      if (pair.second)
+        nng_msg_free(pair.second);
+    }
   }
 
   void clear_scopes() {
@@ -505,78 +635,119 @@ class ImscopeProducer {
     }
   }
 
-  // `data_address` is deprecated/unused: transport addressing is now the
-  // Zenoh session plus the `imscope/<name>/...` key-expression prefix, not
-  // a separate socket address. `announce_address` is reinterpreted as an
-  // optional Zenoh locator to explicitly connect to (e.g.
-  // "tcp/127.0.0.1:7447"); an empty string relies on Zenoh's default
-  // scouting/discovery instead, mirroring the Rust producer's
-  // `Option<&str>::None` convention.
   void connect(const char* data_address, const char* announce_address,
                const char* name) {
     stop_flush_thread();
-    (void)data_address;
 
-    this->name = name;
-
-    {
-      std::lock_guard<std::mutex> lock(active_requests_mutex);
-      active_requests.clear();
-    }
-    {
-      std::lock_guard<std::mutex> lock(acquired_buffers_mutex);
-      acquired_buffers.clear();
-    }
-    {
-      std::lock_guard<std::mutex> lock(scalar_mutex);
-      scalar_accumulators.clear();
+    if (discovery_server_handle) {
+      imscope_discovery_server_stop(discovery_server_handle);
+      discovery_server_handle = nullptr;
     }
 
-    // Drop the old session (if any) before opening a new one -- this
-    // undeclares all previously-declared queryables.
-    session.reset();
+    this->name = (name && strlen(name) > 0) ? name : "imscope";
 
-    try {
-      session.emplace(open_zenoh_session(announce_address));
-    } catch (const zenoh::ZException& e) {
-      spdlog::error(
-          "ImscopeProducer: failed to open Zenoh session (locator='{}'): {}",
-          announce_address, e.what());
-      return;
+    std::string req_data_addr = (data_address && strlen(data_address) > 0)
+                                    ? data_address
+                                    : "";
+    std::string req_ann_addr =
+        (announce_address && strlen(announce_address) > 0) ? announce_address
+                                                           : "";
+
+    // If announce_address was passed as just a name (not URL), use it as name
+    if (!req_ann_addr.empty() &&
+        req_ann_addr.rfind("tcp://", 0) != 0 &&
+        req_ann_addr.rfind("ipc://", 0) != 0 &&
+        req_ann_addr.rfind("inproc://", 0) != 0) {
+      this->name = req_ann_addr;
+      req_ann_addr = "";
     }
 
-    data_key_prefix = "imscope/" + this->name + "/data";
-    control_key = "imscope/" + this->name + "/control";
-    std::string announce_key = "imscope/" + this->name + "/announce";
-
-    try {
-      session->declare_background_queryable(
-          announce_key,
-          [this](zenoh::Query& query) { handle_announce_query(query); },
-          []() {});
-      session->declare_background_queryable(
-          control_key,
-          [this](zenoh::Query& query) { handle_control_query(query); },
-          []() {});
-    } catch (const zenoh::ZException& e) {
-      spdlog::error(
-          "ImscopeProducer: failed to declare announce/control queryables: "
-          "{}",
-          e.what());
-      session.reset();
-      return;
+    // Default to dynamic TCP if not specified
+    if (req_ann_addr.empty()) {
+      req_ann_addr = "tcp://0.0.0.0:0";
     }
-
-    {
-      std::lock_guard<std::mutex> lock(scopes_mutex);
-      for (size_t i = 0; i < configured_scopes.size(); i++) {
-        declare_data_queryable(static_cast<int>(i));
+    if (req_data_addr.empty()) {
+      if (req_ann_addr.rfind("inproc://", 0) == 0) {
+        req_data_addr = req_ann_addr + "-data";
+      } else if (req_ann_addr.rfind("ipc://", 0) == 0) {
+        req_data_addr = req_ann_addr + "-data";
+      } else {
+        req_data_addr = "tcp://0.0.0.0:0";
       }
     }
 
-    spdlog::debug(
-        "ImscopeProducer: producer '{}' listening on Zenoh (locator='{}')",
-        this->name, announce_address);
+    // Clear previous state if any
+    workers.clear();
+    active_requests.clear();
+    acquired_msgs.clear();
+    {
+      std::lock_guard<std::mutex> s_lock(scalar_mutex);
+      scalar_accumulators.clear();
+    }
+    if (nng_socket_id(data_socket) > 0) {
+      nng_close(data_socket);
+    }
+    if (nng_socket_id(announce_socket) > 0) {
+      nng_close(announce_socket);
+    }
+    if (nng_socket_id(control_socket) > 0) {
+      nng_close(control_socket);
+    }
+
+    // Open and bind data socket
+    nng_rep0_open(&data_socket);
+    int rv = bind_socket_url(data_socket, req_data_addr, this->data_address);
+    if (rv != 0) {
+      spdlog::error("ImscopeProducer: Failed to bind data socket to {}: {}",
+                    req_data_addr, nng_strerror(rv));
+      return;
+    }
+
+    // Open and bind announce socket
+    nng_rep0_open(&announce_socket);
+    rv = bind_socket_url(announce_socket, req_ann_addr, this->announce_address);
+    if (rv != 0) {
+      spdlog::error("ImscopeProducer: Failed to bind announce socket to {}: {}",
+                    req_ann_addr, nng_strerror(rv));
+      return;
+    }
+
+    // Derive or bind control socket
+    std::string req_ctl_addr;
+    if (req_ann_addr.rfind("tcp://", 0) == 0) {
+      req_ctl_addr = "tcp://0.0.0.0:0";
+    } else {
+      req_ctl_addr = derive_control_address(this->announce_address);
+    }
+
+    nng_rep0_open(&control_socket);
+    rv = bind_socket_url(control_socket, req_ctl_addr, this->control_address);
+    if (rv != 0) {
+      spdlog::error("ImscopeProducer: Failed to bind control socket to {}: {}",
+                    req_ctl_addr, nng_strerror(rv));
+    } else {
+      settings_handler =
+          std::make_unique<SettingsCtx>(this->control_socket, this);
+    }
+
+    announce_handler =
+        std::make_unique<AnnounceCtx>(this->announce_socket, this);
+
+    std::lock_guard<std::mutex> lock(scopes_mutex);
+    size_t num_workers = std::max((size_t)64, configured_scopes.size() * 4);
+    for (size_t i = 0; i < num_workers; i++) {
+      workers.push_back(std::make_unique<ScopeCtx>(this->data_socket, this));
+    }
+
+    spdlog::info(
+        "ImscopeProducer '{}' started. Announce: {}, Data: {}, Control: {}",
+        this->name, this->announce_address, this->data_address,
+        this->control_address);
+
+    if (this->announce_address.rfind("tcp://", 0) == 0) {
+      discovery_server_handle =
+          imscope_discovery_server_start(this->name, this->announce_address);
+    }
 
     start_flush_thread();
   }
@@ -584,43 +755,39 @@ class ImscopeProducer {
   imscope_return_t add_scope(const char* name, scope_type_t type,
                              const char* group = "",
                              scope_domain_t domain = SCOPE_DOMAIN_TIME) {
-    int new_id = -1;
-    {
-      std::lock_guard<std::mutex> lock(scopes_mutex);
-      for (size_t i = 0; i < configured_scopes.size(); i++) {
-        if (configured_scopes[i].name == name) {
-          return IMSCOPE_SUCCESS;
-        }
+    std::lock_guard<std::mutex> lock(scopes_mutex);
+    for (size_t i = 0; i < configured_scopes.size(); i++) {
+      if (configured_scopes[i].name == name) {
+        return IMSCOPE_SUCCESS;
       }
-      scope_info_t scope_info = {name, group ? group : "", type, domain};
-      configured_scopes.push_back(scope_info);
-      new_id = static_cast<int>(configured_scopes.size() - 1);
     }
-    declare_data_queryable(new_id);
+    scope_info_t scope_info = {name, group ? group : "", type, domain};
+    configured_scopes.push_back(scope_info);
+    if (nng_socket_id(data_socket) > 0) {
+      for (int i = 0; i < 4; i++) {
+        workers.push_back(std::make_unique<ScopeCtx>(this->data_socket, this));
+      }
+    }
     return IMSCOPE_SUCCESS;
   }
 
   int get_or_register_scope(const char* name, scope_type_t type,
-                            const char* group = "",
-                            scope_domain_t domain = SCOPE_DOMAIN_TIME) {
-    int id = -1;
-    bool is_new = false;
-    {
-      std::lock_guard<std::mutex> lock(scopes_mutex);
-      for (size_t i = 0; i < configured_scopes.size(); i++) {
-        if (configured_scopes[i].name == name) {
-          return static_cast<int>(i);
-        }
+                             const char* group = "",
+                             scope_domain_t domain = SCOPE_DOMAIN_TIME) {
+    std::lock_guard<std::mutex> lock(scopes_mutex);
+    for (size_t i = 0; i < configured_scopes.size(); i++) {
+      if (configured_scopes[i].name == name) {
+        return static_cast<int>(i);
       }
-      scope_info_t scope_info = {name, group ? group : "", type, domain};
-      configured_scopes.push_back(scope_info);
-      id = static_cast<int>(configured_scopes.size() - 1);
-      is_new = true;
     }
-    if (is_new) {
-      declare_data_queryable(id);
+    scope_info_t scope_info = {name, group ? group : "", type, domain};
+    configured_scopes.push_back(scope_info);
+    if (nng_socket_id(data_socket) > 0) {
+      for (int i = 0; i < 4; i++) {
+        workers.push_back(std::make_unique<ScopeCtx>(this->data_socket, this));
+      }
     }
-    return id;
+    return static_cast<int>(configured_scopes.size() - 1);
   }
 
   int get_scope_id_by_name(const char* name) {
@@ -635,87 +802,135 @@ class ImscopeProducer {
 
   imscope_return_t send_scope_data(uint32_t* data, int id, size_t num_samples,
                                    int frame, int slot, uint64_t timestamp) {
-    std::optional<zenoh::Query> query;
+    std::vector<ScopeCtx*> waiting;
     {
       std::lock_guard<std::mutex> lock(active_requests_mutex);
       auto it = active_requests.find(id);
-      if (it == active_requests.end()) {
+      if (it == active_requests.end() || it->second.empty()) {
         return IMSCOPE_ERROR_BUSY;
       }
-      query.emplace(std::move(it->second));
+      waiting = std::move(it->second);
       active_requests.erase(it);
     }
 
     auto start = std::chrono::high_resolution_clock::now();
 
     size_t size = sizeof(scope_msg_t) + sizeof(uint32_t) * num_samples;
-    std::vector<uint8_t> bytes(size, 0);
-    scope_msg_t* msg = reinterpret_cast<scope_msg_t*>(bytes.data());
+    nng_msg* base_msg = nullptr;
+    if (nng_msg_alloc(&base_msg, size) != 0) {
+      for (auto* worker : waiting) {
+        worker->req_received.store(false);
+        nng_msg* req_msg = nng_aio_get_msg(worker->recv_aio);
+        if (req_msg)
+          nng_msg_free(req_msg);
+        nng_ctx_recv(worker->ctx, worker->recv_aio);
+      }
+      return IMSCOPE_ERROR_INTERNAL;
+    }
+
+    scope_msg_t* msg = (scope_msg_t*)nng_msg_body(base_msg);
     msg->id = id;
     msg->meta.frame = frame;
     msg->meta.slot = slot;
     msg->meta.timestamp = timestamp;
     msg->data_size = num_samples * sizeof(uint32_t);
-    std::memcpy((void*)(msg + 1), data, sizeof(uint32_t) * num_samples);
+    memcpy((void*)(msg + 1), data, sizeof(uint32_t) * num_samples);
     msg->time_taken_in_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::high_resolution_clock::now() - start)
             .count();
 
-    try {
-      query->reply(query->get_keyexpr(), zenoh::Bytes(std::move(bytes)));
-    } catch (const zenoh::ZException& e) {
-      spdlog::error("ImscopeProducer: failed to reply to scope {} query: {}",
-                    id, e.what());
-      return IMSCOPE_ERROR_INTERNAL;
+    for (size_t i = 0; i < waiting.size(); i++) {
+      ScopeCtx* worker = waiting[i];
+      worker->req_received.store(false);
+      nng_msg* req_msg = nng_aio_get_msg(worker->recv_aio);
+      if (req_msg) {
+        nng_msg_free(req_msg);
+      }
+
+      nng_msg* msg_to_send = nullptr;
+      if (i == waiting.size() - 1) {
+        msg_to_send = base_msg;
+      } else {
+        if (nng_msg_dup(&msg_to_send, base_msg) != 0) {
+          continue;
+        }
+      }
+
+      nng_aio_set_msg(worker->send_aio, msg_to_send);
+      nng_ctx_send(worker->ctx, worker->send_aio);
     }
 
-    return IMSCOPE_SUCCESS;
+    int last_rv = 0;
+    for (auto* worker : waiting) {
+      nng_aio_wait(worker->send_aio);
+      int rv = nng_aio_result(worker->send_aio);
+      if (rv != 0) {
+        last_rv = rv;
+      }
+      nng_ctx_recv(worker->ctx, worker->recv_aio);
+    }
+
+    return last_rv == 0 ? IMSCOPE_SUCCESS : IMSCOPE_ERROR_INTERNAL;
   }
+
+  std::unordered_map<int, nng_msg*> acquired_msgs;
 
   void* acquire_buffer(int id, size_t num_samples) {
     {
       std::lock_guard<std::mutex> lock(active_requests_mutex);
-      if (active_requests.find(id) == active_requests.end()) {
+      auto it = active_requests.find(id);
+      if (it == active_requests.end() || it->second.empty()) {
         return nullptr;
       }
     }
 
     size_t size = sizeof(scope_msg_t) + sizeof(uint32_t) * num_samples;
-    std::lock_guard<std::mutex> lock(acquired_buffers_mutex);
-    auto& buffer = acquired_buffers[id];
-    buffer.assign(size, 0);
-    scope_msg_t* msg = reinterpret_cast<scope_msg_t*>(buffer.data());
+    nng_msg* allocated_msg = nullptr;
+    if (nng_msg_alloc(&allocated_msg, size) != 0) {
+      return nullptr;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(acquired_msgs_mutex);
+      acquired_msgs[id] = allocated_msg;
+    }
+
+    scope_msg_t* msg = (scope_msg_t*)nng_msg_body(allocated_msg);
     msg->id = id;
     return (void*)(msg + 1);
   }
 
   imscope_return_t commit_buffer(int id, size_t num_samples, int frame,
                                  int slot, uint64_t timestamp) {
-    std::optional<zenoh::Query> query;
+    nng_msg* base_msg = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(acquired_msgs_mutex);
+      auto it = acquired_msgs.find(id);
+      if (it == acquired_msgs.end() || it->second == nullptr) {
+        return IMSCOPE_ERROR_NOT_INITIALIZED;
+      }
+      base_msg = it->second;
+      acquired_msgs.erase(it);
+    }
+
+    std::vector<ScopeCtx*> waiting;
     {
       std::lock_guard<std::mutex> lock(active_requests_mutex);
       auto it = active_requests.find(id);
-      if (it == active_requests.end()) {
-        return IMSCOPE_ERROR_BUSY;  // Should not happen if acquired
+      if (it != active_requests.end()) {
+        waiting = std::move(it->second);
+        active_requests.erase(it);
       }
-      query.emplace(std::move(it->second));
-      active_requests.erase(it);
     }
 
-    std::vector<uint8_t> buffer;
-    {
-      std::lock_guard<std::mutex> lock(acquired_buffers_mutex);
-      auto it = acquired_buffers.find(id);
-      if (it == acquired_buffers.end()) {
-        return IMSCOPE_ERROR_NOT_INITIALIZED;
-      }
-      buffer = std::move(it->second);
-      acquired_buffers.erase(it);
+    if (waiting.empty()) {
+      nng_msg_free(base_msg);
+      return IMSCOPE_ERROR_BUSY;
     }
 
     auto start = std::chrono::high_resolution_clock::now();
-    scope_msg_t* msg = reinterpret_cast<scope_msg_t*>(buffer.data());
+    scope_msg_t* msg = (scope_msg_t*)nng_msg_body(base_msg);
     msg->id = id;
     msg->meta.frame = frame;
     msg->meta.slot = slot;
@@ -726,16 +941,38 @@ class ImscopeProducer {
             std::chrono::high_resolution_clock::now() - start)
             .count();
 
-    try {
-      query->reply(query->get_keyexpr(), zenoh::Bytes(std::move(buffer)));
-    } catch (const zenoh::ZException& e) {
-      spdlog::error(
-          "ImscopeProducer: failed to reply to scope {} query (commit): {}",
-          id, e.what());
-      return IMSCOPE_ERROR_INTERNAL;
+    for (size_t i = 0; i < waiting.size(); i++) {
+      ScopeCtx* worker = waiting[i];
+      worker->req_received.store(false);
+      nng_msg* req_msg = nng_aio_get_msg(worker->recv_aio);
+      if (req_msg) {
+        nng_msg_free(req_msg);
+      }
+
+      nng_msg* msg_to_send = nullptr;
+      if (i == waiting.size() - 1) {
+        msg_to_send = base_msg;
+      } else {
+        if (nng_msg_dup(&msg_to_send, base_msg) != 0) {
+          continue;
+        }
+      }
+
+      nng_aio_set_msg(worker->send_aio, msg_to_send);
+      nng_ctx_send(worker->ctx, worker->send_aio);
     }
 
-    return IMSCOPE_SUCCESS;
+    int last_rv = 0;
+    for (auto* worker : waiting) {
+      nng_aio_wait(worker->send_aio);
+      int rv = nng_aio_result(worker->send_aio);
+      if (rv != 0) {
+        last_rv = rv;
+      }
+      nng_ctx_recv(worker->ctx, worker->recv_aio);
+    }
+
+    return last_rv == 0 ? IMSCOPE_SUCCESS : IMSCOPE_ERROR_INTERNAL;
   }
 };
 

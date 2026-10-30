@@ -1,19 +1,19 @@
 # imscope_consumer Analysis and Description
 
-The `imscope_consumer` is the client-side component of the `imscope` project, responsible for discovering producers and requesting data through a high-performance communication layer based on **Zenoh** (Eclipse zenoh), using the official `zenoh-cpp`/`zenoh-c` bindings.
+The `imscope_consumer` is the client-side component of the `imscope` project, responsible for discovering producers and requesting data through a high-performance, asynchronous communication layer based on **NNG (Nanomsg Next Gen)**.
 
 ## Architecture and Discovery Process
 
-The consumer acts as the **querier**: it sends a `Query` and the producer (the **queryable**) replies to it on-demand, ensuring that it only receives data when it's ready to process it.
+The consumer is designed around a **REQ/REP** pattern, where it acts as the **requestor (REQ)**. It pulls data from the producer (the **replier**) on-demand, ensuring that it only receives data when it's ready to process it.
 
 ### Discovery Phase
 
 Before data can be requested, the consumer must discover the producer's configuration:
 
-1.  **Open a Session**: The consumer opens a Zenoh `Session` (optionally connecting to an explicit locator; otherwise relying on default scouting/discovery).
-2.  **Request Info**: It queries `imscope/<name>/announce` with an `announce_request_t` and waits for an `announce_response_t` reply.
-3.  **Configure Consumer**: The response contains the producer's name and the list of available scopes.
-4.  **Initialize**: A new `ImscopeConsumer` instance is created with this configuration, taking ownership of the session.
+1.  **Announce Connection**: The consumer opens a temporary REQ socket and connects to the producer's `announce_address`.
+2.  **Request Info**: It sends an `announce_request_t` and waits for an `announce_response_t`.
+3.  **Configure Consumer**: The response contains the producer's name, data address, and the list of available scopes.
+4.  **Initialize**: A new `ImscopeConsumer` instance is created with this configuration, and it opens a dedicated `data_socket`.
 
 ### Data Collection Flow
 
@@ -21,15 +21,17 @@ Before data can be requested, the consumer must discover the producer's configur
 sequenceDiagram
     participant App
     participant ImscopeConsumer
+    participant ScopeCtx
     participant Producer
 
     App->>ImscopeConsumer: request_data(scope_id)
-    ImscopeConsumer->>Producer: query imscope/<name>/data/<id> (scope_request_t)
-    Note over ImscopeConsumer: stores the reply channel in scope_pending[scope_id]
+    ImscopeConsumer->>ScopeCtx: nng_ctx_send(scope_request_t)
+    ScopeCtx->>Producer: scope_request_t
+    ImscopeConsumer->>ScopeCtx: nng_ctx_recv(aio)
 
-    Note over Producer: Producer processes request, calls imscope_try_send_data()
+    Note over Producer: Producer processes request
 
-    Producer-->>ImscopeConsumer: reply: scope_msg_t
+    Producer-->>ScopeCtx: scope_msg_t
 
     App->>ImscopeConsumer: try_collect_scope_msg(scope_id)
     ImscopeConsumer->>App: NngMsgPtr (data)
@@ -38,23 +40,23 @@ sequenceDiagram
 ## Key Components
 
 - **`ImscopeConsumer` (Main Class)**:
-    - Owns the Zenoh `Session` and manages the discovery process.
+    - Manages the `data_socket` and the discovery process.
     - Provides a high-level API for requesting and collecting data.
-    - Holds one `std::optional<zenoh::channels::FifoHandler<zenoh::Reply>>` per configured scope (`scope_pending`) — the reply channel for that scope's in-flight `get()` call while a `request_data()` is outstanding, the direct analog of the old NNG version's per-scope `nng_ctx`/`nng_aio` pair. Empty when no request is outstanding.
+- **`ScopeCtx` (Internal Context)**:
+    - Encapsulates an `nng_ctx` for asynchronous I/O.
+    - Each scope has its own `ScopeCtx`, allowing multiple concurrent requests on a single socket.
 - **`NngMsgPtr` (Memory Management)**:
-    - A `std::shared_ptr<void>`, kept under this name for source compatibility with existing call sites.
-    - No longer backed by an `nng_msg`: the pointee is now a heap-allocated `std::vector<uint8_t>` built from a Zenoh reply payload, kept alive via the shared_ptr's aliasing constructor.
+    - A `std::shared_ptr<void>` with a custom deleter.
+    - It automatically calls `nng_msg_free` when the last reference is destroyed, preventing memory leaks of NNG messages.
 
 ## API and Usage
 
 ### Connecting to a Producer
 
 ```cpp
-ImscopeConsumer* consumer = ImscopeConsumer::connect("My Producer");
-// Or with an explicit locator instead of default scouting:
-ImscopeConsumer* consumer = ImscopeConsumer::connect("My Producer", "tcp/127.0.0.1:7447");
+ImscopeConsumer* consumer = ImscopeConsumer::connect("tcp://127.0.0.1:5555");
 ```
-`name` is the producer's name (the `imscope/<name>/...` key-expression prefix) — this replaces the old NNG `announce_address` URL. Queries the announce key expression and returns a configured consumer instance.
+Connects to the producer's announce address and returns a configured consumer instance.
 
 ### Requesting and Collecting Data
 
@@ -80,6 +82,6 @@ The consumer also provides helpers for processing common data types:
 
 ## Threading and Synchronization
 
-- **Asynchronous Operations**: `request_data()` fires a Zenoh `get()` and returns immediately (replies arrive asynchronously via Zenoh's own runtime into a `FifoHandler` channel); `try_collect_scope_msg()` polls that channel non-blockingly, mirroring the old NNG version's `nng_aio_result(...) == -1` "still in flight" check.
-- **Parallel Requests**: Since each scope has its own pending-reply slot, the consumer can handle requests for different scopes concurrently over the same `Session`.
-- **Thread Safety**: The consumer is designed to be used in a single-threaded loop or with a polling mechanism. If shared across threads, external synchronization may be required (`scopes_mutex` protects `configured_scopes`, but `scope_pending` polling itself is not designed for concurrent access from multiple threads on the same scope).
+- **Asynchronous Operations**: Uses NNG's asynchronous `nng_aio` mechanism to avoid blocking.
+- **Parallel Requests**: Since each scope has its own `nng_ctx`, the consumer can handle requests for different scopes in parallel on the same `data_socket`.
+- **Thread Safety**: The consumer is designed to be used in a single-threaded loop or with a polling mechanism. If shared across threads, external synchronization may be required, although `nng_ctx` itself is thread-safe for individual requests.

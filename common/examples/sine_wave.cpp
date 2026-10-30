@@ -21,10 +21,8 @@ int main() {
   };
 
   std::cout << "Starting SineWave example..." << std::endl;
-  // `data_address` is deprecated/unused; the second parameter is now an
-  // optional Zenoh locator to explicitly connect to -- "" relies on Zenoh's
-  // default scouting/discovery instead.
-  imscope_init_producer("", "", "sine_wave_example", scopes, 1);
+  imscope_init_producer("tcp://127.0.0.1:5556", "tcp://127.0.0.1:5557",
+                        "sine_wave_example", scopes, 1);
 
   uint64_t timestamp = 0;
   double phase = 0.0;
