@@ -62,7 +62,8 @@ struct DiscoveryServer {
     running.store(false);
     if (wake_fd >= 0) {
       uint64_t val = 1;
-      write(wake_fd, &val, sizeof(val));
+      ssize_t ret = write(wake_fd, &val, sizeof(val));
+      (void)ret;
     }
     if (thread.joinable()) {
       thread.join();

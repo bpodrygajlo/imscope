@@ -96,7 +96,7 @@ class ImscopeProducer {
     int id;
 
     ScopeCtx(nng_socket socket, ImscopeProducer* p)
-        : parent(p), id(-1), req_received(false) {
+        : req_received(false), parent(p), id(-1) {
       nng_ctx_open(&ctx, socket);
       nng_aio_alloc(&send_aio, NULL, NULL);
       nng_aio_alloc(&recv_aio, recv_callback, this);
