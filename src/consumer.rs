@@ -5,11 +5,10 @@
  * See LICENSE file in the project root for full license information.
  */
 
+use nng::options::{Options, RecvTimeout};
+use nng::{Protocol, Socket};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
-
-use zenoh::Session;
-use zenoh::Wait;
 
 pub const ANNOUNCE_MSG_ID: u32 = 0xABCDEF01;
 pub const SCOPE_REQ_MSG_ID: u32 = 0xABCDEF02;
@@ -526,17 +525,64 @@ pub fn parse_setting_response(bytes: &[u8]) -> Result<(i32, Vec<SettingInfo>), S
     Ok((status, settings))
 }
 
+pub fn discover_producer(
+    name: &str,
+    target_host: Option<&str>,
+    timeout: Duration,
+) -> Result<String, String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    socket
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .map_err(|e| e.to_string())?;
+    let _ = socket.set_broadcast(true);
+
+    let query = format!("IMSCOPE_DISCOVER {}", name);
+    let bytes = query.as_bytes();
+
+    let mcast_addr = "239.255.77.77:15555";
+    let loopback_addr = "127.0.0.1:15555";
+
+    let start = std::time::Instant::now();
+    let mut buf = [0u8; 512];
+
+    while start.elapsed() < timeout {
+        let _ = socket.send_to(bytes, mcast_addr);
+        let _ = socket.send_to(bytes, loopback_addr);
+        if let Some(host) = target_host {
+            let target = if host.contains(':') {
+                host.to_string()
+            } else {
+                format!("{}:15555", host)
+            };
+            let _ = socket.send_to(bytes, &target);
+        }
+
+        match socket.recv_from(&mut buf) {
+            Ok((n, _)) => {
+                let msg = String::from_utf8_lossy(&buf[..n]);
+                let parts: Vec<&str> = msg.split_whitespace().collect();
+                if parts.len() >= 3 && parts[0] == "IMSCOPE_BEACON" {
+                    if parts[1] == name || name == "*" || name.is_empty() {
+                        return Ok(parts[2].to_string());
+                    }
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Continue waiting until overall deadline
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err(format!("Discovery timed out for producer '{}'", name))
+}
+
 // Commands from TUI to Worker thread
 pub enum WorkerCommand {
     Connect {
-        /// The producer's name -- the `imscope/<name>/...` key-expression
-        /// prefix this worker will query. This used to be a full NNG dial
-        /// address; under Zenoh there is no per-producer socket address, so
-        /// this is now just the producer's announced `name`.
         name: String,
-        /// An explicit Zenoh locator to connect to (e.g.
-        /// `"tcp/127.0.0.1:7447"`). `None` relies on Zenoh's default
-        /// scouting/discovery instead.
         locator: Option<String>,
     },
     SelectScope {
@@ -590,11 +636,12 @@ pub enum WorkerEvent {
 }
 
 pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>) {
-    let mut session: Option<Session> = None;
+    let mut data_socket: Option<Socket> = None;
+    let mut control_socket: Option<Socket> = None;
     let mut selected_scopes: Vec<(usize, ScopeType)> = Vec::new();
     let mut scope_cycle_idx: usize = 0;
     let mut auto_collect = true;
-    let mut producer_name: Option<String> = None;
+    let mut announce_url: Option<String> = None;
 
     let mut filter_enabled = false;
     let mut filter_cutoff = 0.0f32;
@@ -603,7 +650,7 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
     loop {
         // 1. Process all pending commands with no blocking if auto collecting,
         // or blocking if idle.
-        let has_work = auto_collect && !selected_scopes.is_empty() && session.is_some();
+        let has_work = auto_collect && !selected_scopes.is_empty() && data_socket.is_some();
 
         let cmd = if has_work {
             match cmd_rx.try_recv() {
@@ -621,35 +668,122 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
         if let Some(command) = cmd {
             match command {
                 WorkerCommand::Connect { name, locator } => {
-                    producer_name = Some(name.clone());
                     let _ = event_tx.send(WorkerEvent::Connecting);
-                    match open_session(locator.as_deref()) {
-                        Ok(sess) => match perform_announce(&sess, &name) {
-                            Ok(ann) => {
+                    let resolved_url = if let Some(ref loc) = locator {
+                        if loc.starts_with("tcp://")
+                            || loc.starts_with("ipc://")
+                            || loc.starts_with("inproc://")
+                        {
+                            Ok(loc.clone())
+                        } else {
+                            discover_producer(&name, Some(loc), Duration::from_millis(2000))
+                        }
+                    } else if name.starts_with("tcp://")
+                        || name.starts_with("ipc://")
+                        || name.starts_with("inproc://")
+                    {
+                        Ok(name.clone())
+                    } else {
+                        discover_producer(&name, None, Duration::from_millis(2000))
+                    };
+
+                    let url = match resolved_url {
+                        Ok(u) => u,
+                        Err(e) => {
+                            let _ = event_tx.send(WorkerEvent::ConnectionFailed(e));
+                            data_socket = None;
+                            control_socket = None;
+                            continue;
+                        }
+                    };
+
+                    announce_url = Some(url.clone());
+                    match perform_announce(&url) {
+                        Ok(ann) => {
+                            let mut d_sock = None;
+                            let mut c_sock = None;
+                            match Socket::new(Protocol::Req0) {
+                                Ok(sock) => match sock.dial(&ann.data_address) {
+                                    Ok(_) => {
+                                        let _ = sock
+                                            .set_opt::<RecvTimeout>(Some(Duration::from_secs(1)));
+                                        d_sock = Some(sock);
+                                    }
+                                    Err(e) => {
+                                        let _ =
+                                            event_tx.send(WorkerEvent::ConnectionFailed(format!(
+                                                "Failed to dial data address {}: {}",
+                                                ann.data_address, e
+                                            )));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = event_tx.send(WorkerEvent::ConnectionFailed(format!(
+                                        "Failed to create data socket: {}",
+                                        e
+                                    )));
+                                }
+                            }
+
+                            if d_sock.is_some() {
+                                match Socket::new(Protocol::Req0) {
+                                    Ok(sock) => match sock.dial(&ann.control_address) {
+                                        Ok(_) => {
+                                            let _ = sock.set_opt::<RecvTimeout>(Some(
+                                                Duration::from_secs(1),
+                                            ));
+                                            c_sock = Some(sock);
+                                        }
+                                        Err(e) => {
+                                            let _ = event_tx.send(WorkerEvent::Error(format!(
+                                                "Failed to dial control address {}: {}",
+                                                ann.control_address, e
+                                            )));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        let _ = event_tx.send(WorkerEvent::Error(format!(
+                                            "Failed to create control socket: {}",
+                                            e
+                                        )));
+                                    }
+                                }
+                            }
+
+                            if d_sock.is_some() {
+                                data_socket = d_sock;
+                                control_socket = c_sock;
                                 let _ = event_tx.send(WorkerEvent::Connected {
                                     name: ann.name,
                                     data_address: ann.data_address,
                                     control_address: ann.control_address,
                                     scopes: ann.scopes,
                                 });
-                                // Automatically fetch initial settings when connected.
-                                // Best-effort, same as before the Zenoh port: a
-                                // failure here is silently dropped rather than
-                                // surfaced as an Error.
-                                if let Ok(settings) = fetch_settings(&sess, &name) {
-                                    let _ =
-                                        event_tx.send(WorkerEvent::SettingsRefreshed { settings });
+                                // Automatically fetch initial settings when connected
+                                if let Some(ref sock) = control_socket {
+                                    let req = build_get_all_request();
+                                    if sock.send(&req).is_ok() {
+                                        if let Ok(reply) = sock.recv() {
+                                            if let Ok((_status, settings)) =
+                                                parse_setting_response(&reply)
+                                            {
+                                                let _ =
+                                                    event_tx.send(WorkerEvent::SettingsRefreshed {
+                                                        settings,
+                                                    });
+                                            }
+                                        }
+                                    }
                                 }
-                                session = Some(sess);
+                            } else {
+                                data_socket = None;
+                                control_socket = None;
                             }
-                            Err(e) => {
-                                let _ = event_tx.send(WorkerEvent::ConnectionFailed(e));
-                                session = None;
-                            }
-                        },
+                        }
                         Err(e) => {
                             let _ = event_tx.send(WorkerEvent::ConnectionFailed(e));
-                            session = None;
+                            data_socket = None;
+                            control_socket = None;
                         }
                     }
                 }
@@ -665,26 +799,27 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
                     scope_cycle_idx = 0;
                 }
                 WorkerCommand::RequestSingleFrame => {
-                    if let (Some(sess), Some(pname)) = (&session, &producer_name)
-                        && let Some(&(scope_id, scope_type)) = selected_scopes.first()
-                    {
-                        match fetch_data(sess, pname, scope_id, scope_type) {
-                            Ok(msg) => {
-                                if !filter_enabled
-                                    || scope_type != ScopeType::IqData
-                                    || check_noise_filter(
-                                        &msg.real,
-                                        &msg.imag,
-                                        filter_cutoff,
-                                        filter_percentage,
-                                    )
-                                {
-                                    let _ = event_tx.send(WorkerEvent::NewData { scope_id, msg });
+                    if let Some(sock) = &data_socket {
+                        if let Some(&(scope_id, scope_type)) = selected_scopes.first() {
+                            match fetch_data(sock, scope_id, scope_type) {
+                                Ok(msg) => {
+                                    if !filter_enabled
+                                        || scope_type != ScopeType::IqData
+                                        || check_noise_filter(
+                                            &msg.real,
+                                            &msg.imag,
+                                            filter_cutoff,
+                                            filter_percentage,
+                                        )
+                                    {
+                                        let _ =
+                                            event_tx.send(WorkerEvent::NewData { scope_id, msg });
+                                    }
                                 }
-                            }
-                            Err(e) => {
-                                let _ = event_tx
-                                    .send(WorkerEvent::Error(format!("Fetch error: {}", e)));
+                                Err(e) => {
+                                    let _ = event_tx
+                                        .send(WorkerEvent::Error(format!("Fetch error: {}", e)));
+                                }
                             }
                         }
                     }
@@ -702,17 +837,26 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
                     filter_percentage = percentage;
                 }
                 WorkerCommand::RefreshScopes => {
-                    if let (Some(sess), Some(pname)) = (&session, &producer_name) {
-                        match perform_announce(sess, pname) {
+                    if let Some(ref url) = announce_url {
+                        match perform_announce(url) {
                             Ok(ann) => {
                                 let _ = event_tx
                                     .send(WorkerEvent::ScopesRefreshed { scopes: ann.scopes });
-                                // Also fetch settings when scopes are refreshed. Same
-                                // best-effort, silently-dropped-on-failure behavior as
-                                // the initial fetch in `Connect`.
-                                if let Ok(settings) = fetch_settings(sess, pname) {
-                                    let _ =
-                                        event_tx.send(WorkerEvent::SettingsRefreshed { settings });
+                                // Also fetch settings when scopes are refreshed
+                                if let Some(ref sock) = control_socket {
+                                    let req = build_get_all_request();
+                                    if sock.send(&req).is_ok() {
+                                        if let Ok(reply) = sock.recv() {
+                                            if let Ok((_status, settings)) =
+                                                parse_setting_response(&reply)
+                                            {
+                                                let _ =
+                                                    event_tx.send(WorkerEvent::SettingsRefreshed {
+                                                        settings,
+                                                    });
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -725,15 +869,33 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
                     }
                 }
                 WorkerCommand::GetSettings => {
-                    if let (Some(sess), Some(pname)) = (&session, &producer_name) {
-                        match fetch_settings(sess, pname) {
-                            Ok(settings) => {
-                                let _ = event_tx.send(WorkerEvent::SettingsRefreshed { settings });
-                            }
+                    if let Some(ref sock) = control_socket {
+                        let req = build_get_all_request();
+                        match sock.send(&req) {
+                            Ok(_) => match sock.recv() {
+                                Ok(reply) => match parse_setting_response(&reply) {
+                                    Ok((_status, settings)) => {
+                                        let _ = event_tx
+                                            .send(WorkerEvent::SettingsRefreshed { settings });
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(WorkerEvent::Error(format!(
+                                            "Failed to parse settings: {}",
+                                            e
+                                        )));
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = event_tx.send(WorkerEvent::Error(format!(
+                                        "Failed to receive settings: {}",
+                                        e
+                                    )));
+                                }
+                            },
                             Err(e) => {
                                 let _ = event_tx.send(WorkerEvent::Error(format!(
-                                    "Failed to get settings: {}",
-                                    e
+                                    "Failed to send settings request: {}",
+                                    e.1
                                 )));
                             }
                         }
@@ -744,17 +906,25 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
                     setting_type,
                     value,
                 } => {
-                    if let (Some(sess), Some(pname)) = (&session, &producer_name) {
+                    if let Some(ref sock) = control_socket {
                         let req = build_set_request(&name, setting_type, &value);
-                        match control_request(sess, pname, req) {
-                            Ok(reply) => match parse_setting_response(&reply) {
-                                Ok((status, _)) => {
-                                    let _ =
-                                        event_tx.send(WorkerEvent::SettingUpdated { name, status });
-                                }
+                        match sock.send(&req) {
+                            Ok(_) => match sock.recv() {
+                                Ok(reply) => match parse_setting_response(&reply) {
+                                    Ok((status, _)) => {
+                                        let _ = event_tx
+                                            .send(WorkerEvent::SettingUpdated { name, status });
+                                    }
+                                    Err(e) => {
+                                        let _ = event_tx.send(WorkerEvent::Error(format!(
+                                            "Failed to parse update reply: {}",
+                                            e
+                                        )));
+                                    }
+                                },
                                 Err(e) => {
                                     let _ = event_tx.send(WorkerEvent::Error(format!(
-                                        "Failed to parse update reply: {}",
+                                        "Failed to receive update reply: {}",
                                         e
                                     )));
                                 }
@@ -762,7 +932,7 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
                             Err(e) => {
                                 let _ = event_tx.send(WorkerEvent::Error(format!(
                                     "Failed to send update request: {}",
-                                    e
+                                    e.1
                                 )));
                             }
                         }
@@ -772,35 +942,35 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
         }
 
         // 2. If auto_collect is enabled, pull data frame (round-robin for groups).
-        if auto_collect
-            && !selected_scopes.is_empty()
-            && let (Some(sess), Some(pname)) = (&session, &producer_name)
-        {
-            if scope_cycle_idx >= selected_scopes.len() {
-                scope_cycle_idx = 0;
-            }
-            let (scope_id, scope_type) = selected_scopes[scope_cycle_idx];
-            scope_cycle_idx = (scope_cycle_idx + 1) % selected_scopes.len();
-
-            match fetch_data(sess, pname, scope_id, scope_type) {
-                Ok(msg) => {
-                    if !filter_enabled
-                        || scope_type != ScopeType::IqData
-                        || check_noise_filter(
-                            &msg.real,
-                            &msg.imag,
-                            filter_cutoff,
-                            filter_percentage,
-                        )
-                    {
-                        let _ = event_tx.send(WorkerEvent::NewData { scope_id, msg });
-                    }
+        if auto_collect && !selected_scopes.is_empty() {
+            if let Some(sock) = &data_socket {
+                if scope_cycle_idx >= selected_scopes.len() {
+                    scope_cycle_idx = 0;
                 }
-                Err(e) => {
-                    if !e.contains("TimedOut") {
-                        let _ = event_tx.send(WorkerEvent::Error(format!("Fetch error: {}", e)));
+                let (scope_id, scope_type) = selected_scopes[scope_cycle_idx];
+                scope_cycle_idx = (scope_cycle_idx + 1) % selected_scopes.len();
+
+                match fetch_data(sock, scope_id, scope_type) {
+                    Ok(msg) => {
+                        if !filter_enabled
+                            || scope_type != ScopeType::IqData
+                            || check_noise_filter(
+                                &msg.real,
+                                &msg.imag,
+                                filter_cutoff,
+                                filter_percentage,
+                            )
+                        {
+                            let _ = event_tx.send(WorkerEvent::NewData { scope_id, msg });
+                        }
                     }
-                    std::thread::sleep(Duration::from_millis(10));
+                    Err(e) => {
+                        if !e.contains("TimedOut") {
+                            let _ =
+                                event_tx.send(WorkerEvent::Error(format!("Fetch error: {}", e)));
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
                 }
             }
         }
@@ -812,109 +982,48 @@ pub fn run_worker(cmd_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>
     }
 }
 
-/// Opens a Zenoh session, optionally connecting to an explicit `locator`
-/// (e.g. `"tcp/127.0.0.1:7447"`); `None` relies on Zenoh's default
-/// scouting/discovery instead. Mirrors `Producer::new`'s session setup in
-/// `producer/src/producer.rs`.
-fn open_session(locator: Option<&str>) -> Result<Session, String> {
-    let mut config = zenoh::Config::default();
-    if let Some(loc) = locator {
-        config
-            .insert_json5("connect/endpoints", &format!("[{loc:?}]"))
-            .map_err(|e| format!("Invalid Zenoh locator '{}': {}", loc, e))?;
-    }
-    zenoh::open(config)
-        .wait()
-        .map_err(|e| format!("Failed to open Zenoh session: {}", e))
-}
+fn perform_announce(url: &str) -> Result<AnnounceResponse, String> {
+    let req_sock =
+        Socket::new(Protocol::Req0).map_err(|e| format!("Failed to create req socket: {}", e))?;
 
-fn perform_announce(session: &Session, name: &str) -> Result<AnnounceResponse, String> {
-    let key_expr = format!("imscope/{name}/announce");
-    let magic_bytes = ANNOUNCE_MSG_ID.to_ne_bytes().to_vec();
+    req_sock
+        .dial(url)
+        .map_err(|e| format!("Failed to dial announce URL: {}", e))?;
 
-    let receiver = session
-        .get(&key_expr)
-        .payload(magic_bytes)
-        .timeout(Duration::from_secs(2))
-        .wait()
-        .map_err(|e| format!("Failed to send announce request: {}", e))?;
+    req_sock
+        .set_opt::<RecvTimeout>(Some(Duration::from_secs(2)))
+        .map_err(|e| format!("Failed to set timeout: {}", e))?;
 
-    let reply = receiver.recv().map_err(|_| {
-        format!("Failed to receive announce response: no reply from producer '{name}'")
-    })?;
+    let magic_bytes = ANNOUNCE_MSG_ID.to_ne_bytes();
+    let req_msg = nng::Message::from(&magic_bytes[..]);
 
-    let sample = reply
-        .result()
-        .map_err(|e| format!("Announce reply carried an error: {}", e))?;
+    req_sock
+        .send(req_msg)
+        .map_err(|e| format!("Failed to send announce request: {:?}", e))?;
 
-    parse_announce_response(&sample.payload().to_bytes())
-}
-
-/// Sends one Zenoh `get()` to the control key expression and returns the
-/// reply payload bytes. Mirrors the old NNG control socket's request/reply
-/// round trip, with the same 1s timeout as the old socket's `RecvTimeout`.
-fn control_request(session: &Session, name: &str, req_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-    let key_expr = format!("imscope/{name}/control");
-
-    let receiver = session
-        .get(&key_expr)
-        .payload(req_bytes)
-        .timeout(Duration::from_secs(1))
-        .wait()
-        .map_err(|e| format!("Failed to send control request: {}", e))?;
-
-    let reply = receiver
+    let res_msg = req_sock
         .recv()
-        .map_err(|_| "Failed to receive control response: no reply from producer".to_string())?;
+        .map_err(|e| format!("Failed to receive announce response: {}", e))?;
 
-    let sample = reply
-        .result()
-        .map_err(|e| format!("Control reply carried an error: {}", e))?;
-
-    Ok(sample.payload().to_bytes().into_owned())
-}
-
-fn fetch_settings(session: &Session, name: &str) -> Result<Vec<SettingInfo>, String> {
-    let bytes = control_request(session, name, build_get_all_request())?;
-    let (_status, settings) = parse_setting_response(&bytes)?;
-    Ok(settings)
+    parse_announce_response(&res_msg)
 }
 
 fn fetch_data(
-    session: &Session,
-    name: &str,
+    sock: &Socket,
     scope_id: usize,
     scope_type: ScopeType,
 ) -> Result<ScopeMessage, String> {
-    let key_expr = format!("imscope/{name}/data/{scope_id}");
-
     // Explicit serialization mirrors scope_request_t { uint32_t magic; int32_t scope_id; }.
     let mut bytes = [0u8; 8];
     bytes[0..4].copy_from_slice(&SCOPE_REQ_MSG_ID.to_ne_bytes());
     bytes[4..8].copy_from_slice(&(scope_id as i32).to_ne_bytes());
+    let req_msg = nng::Message::from(&bytes[..]);
+    sock.send(req_msg)
+        .map_err(|e| format!("Send failed: {:?}", e))?;
 
-    let receiver = session
-        .get(&key_expr)
-        .payload(bytes.to_vec())
-        .timeout(Duration::from_secs(1))
-        .wait()
-        .map_err(|e| format!("Send failed: {}", e))?;
+    let res_msg = sock.recv().map_err(|e| format!("Recv failed: {:?}", e))?;
 
-    // No reply arrives within the timeout window when nobody produced a
-    // frame in time -- the receiver channel simply disconnects. Tag the
-    // message with "TimedOut" so the auto-collect loop's existing
-    // `!e.contains("TimedOut")` check keeps treating this the same way a
-    // NNG `RecvTimeout` expiry was treated: a silent, retry-next-tick drop,
-    // not a `WorkerEvent::Error`.
-    let reply = receiver
-        .recv()
-        .map_err(|_| "Recv failed: TimedOut".to_string())?;
-
-    let sample = reply
-        .result()
-        .map_err(|e| format!("Recv failed: reply carried an error: {}", e))?;
-
-    parse_scope_message(&sample.payload().to_bytes(), scope_type)
+    parse_scope_message(&res_msg, scope_type)
 }
 
 #[cfg(test)]

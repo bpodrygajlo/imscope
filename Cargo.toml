@@ -26,7 +26,7 @@ path = "src/bin/gui.rs"
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 crossterm = "0.29.0"
-zenoh = "1.10.1"
+nng = "1.0.1"
 ratatui = "0.30.0"
 dear-imgui-rs = "0.14.0"
 dear-implot = "0.14.0"

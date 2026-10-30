@@ -28,10 +28,10 @@ struct Args {
     #[arg(long, default_value = "imscope")]
     producer: String,
 
-    /// Optional explicit Zenoh locator to connect to (e.g.
-    /// "tcp/127.0.0.1:7447"). If omitted, relies on Zenoh's default
-    /// scouting/discovery.
-    #[arg(long)]
+    /// Optional explicit locator/host to connect to (e.g.
+    /// "192.168.8.151" or "tcp://192.168.8.151:5555"). If omitted,
+    /// relies on UDP multicast discovery.
+    #[arg(long, visible_alias = "connect", visible_alias = "locator", visible_alias = "host")]
     zenoh_connect: Option<String>,
 }
 
