@@ -122,27 +122,32 @@ ImscopeConsumer* ImscopeConsumer::connect(const char* target,
 
   std::string dial_addr;
   if (locator && strlen(locator) > 0) {
-    dial_addr = locator;
-  } else {
+    if (strncmp(locator, "tcp://", 6) == 0 ||
+        strncmp(locator, "ipc://", 6) == 0 ||
+        strncmp(locator, "inproc://", 9) == 0) {
+      dial_addr = locator;
+    } else {
+      spdlog::info("ImscopeConsumer: Discovering producer '{}' at host '{}'...",
+                   target, locator);
+      dial_addr = imscope_discovery_client_find(target, locator, 2000);
+    }
+  } else if (strncmp(target, "tcp://", 6) == 0 ||
+             strncmp(target, "ipc://", 6) == 0 ||
+             strncmp(target, "inproc://", 9) == 0) {
     dial_addr = target;
+  } else {
+    spdlog::info("ImscopeConsumer: Discovering producer '{}' over multicast...",
+                 target);
+    dial_addr = imscope_discovery_client_find(target, "", 2000);
   }
 
-  // If not a recognized URL scheme, resolve via UDP multicast discovery
-  if (dial_addr.rfind("tcp://", 0) != 0 &&
-      dial_addr.rfind("ipc://", 0) != 0 &&
-      dial_addr.rfind("inproc://", 0) != 0) {
-    spdlog::info("ImscopeConsumer: Discovering producer '{}' over multicast...",
-                 dial_addr);
-    std::string resolved = imscope_discovery_client_find(dial_addr, 1000);
-    if (resolved.empty()) {
-      spdlog::error("ImscopeConsumer: Discovery timed out for producer '{}'",
-                    dial_addr);
-      return nullptr;
-    }
-    spdlog::info("ImscopeConsumer: Discovered producer '{}' at {}", dial_addr,
-                 resolved);
-    dial_addr = resolved;
+  if (dial_addr.empty()) {
+    spdlog::error("ImscopeConsumer: Discovery timed out for producer '{}'",
+                  target);
+    return nullptr;
   }
+  spdlog::info("ImscopeConsumer: Connecting to producer '{}' at {}", target,
+               dial_addr);
 
   nng_socket req_sock;
   int rv = nng_req0_open(&req_sock);

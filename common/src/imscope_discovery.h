@@ -20,10 +20,11 @@ void* imscope_discovery_server_start(const std::string& name,
 // Stops the discovery server and frees resources.
 void imscope_discovery_server_stop(void* handle);
 
-// Queries for a producer by name over UDP multicast.
+// Queries for a producer by name over UDP multicast (and optional unicast host).
 // Returns the announce_url if found within timeout_ms, or empty string.
 std::string imscope_discovery_client_find(const std::string& name,
-                                         int timeout_ms = 500);
+                                         const std::string& host = "",
+                                         int timeout_ms = 1000);
 
 // Resolves the primary local IP address.
 std::string imscope_get_primary_ip();

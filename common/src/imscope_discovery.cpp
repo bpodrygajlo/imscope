@@ -198,6 +198,7 @@ void imscope_discovery_server_stop(void* handle) {
 }
 
 std::string imscope_discovery_client_find(const std::string& name,
+                                         const std::string& host,
                                          int timeout_ms) {
   int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) {
@@ -241,13 +242,40 @@ std::string imscope_discovery_client_find(const std::string& name,
   loopback_dest.sin_addr.s_addr = inet_addr("127.0.0.1");
   loopback_dest.sin_port = htons(IMSCOPE_DISCOVERY_MCAST_PORT);
 
+  // Optional unicast host destination
+  sockaddr_in host_dest{};
+  bool has_host = false;
+  if (!host.empty()) {
+    std::string clean_host = host;
+    int port = IMSCOPE_DISCOVERY_MCAST_PORT;
+    size_t colon = clean_host.rfind(':');
+    if (colon != std::string::npos && clean_host.find("://") == std::string::npos) {
+      try {
+        port = std::stoi(clean_host.substr(colon + 1));
+        clean_host = clean_host.substr(0, colon);
+      } catch (...) {}
+    }
+    host_dest.sin_family = AF_INET;
+    host_dest.sin_port = htons(port);
+    if (inet_pton(AF_INET, clean_host.c_str(), &host_dest.sin_addr) > 0) {
+      has_host = true;
+    }
+  }
+
   std::string query = "IMSCOPE_DISCOVER " + name;
 
-  // Send discovery query over multicast AND loopback
-  sendto(fd, query.c_str(), query.size(), 0,
-         reinterpret_cast<const sockaddr*>(&mcast_dest), sizeof(mcast_dest));
-  sendto(fd, query.c_str(), query.size(), 0,
-         reinterpret_cast<const sockaddr*>(&loopback_dest), sizeof(loopback_dest));
+  auto send_queries = [&]() {
+    sendto(fd, query.c_str(), query.size(), 0,
+           reinterpret_cast<const sockaddr*>(&mcast_dest), sizeof(mcast_dest));
+    sendto(fd, query.c_str(), query.size(), 0,
+           reinterpret_cast<const sockaddr*>(&loopback_dest), sizeof(loopback_dest));
+    if (has_host) {
+      sendto(fd, query.c_str(), query.size(), 0,
+             reinterpret_cast<const sockaddr*>(&host_dest), sizeof(host_dest));
+    }
+  };
+
+  send_queries();
 
   auto deadline = std::chrono::steady_clock::now() +
                   std::chrono::milliseconds(timeout_ms);
