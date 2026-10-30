@@ -17,6 +17,11 @@ CPMAddPackage(
 # adding zenoh-c first (which defines that target as an IMPORTED GLOBAL
 # target) makes zenoh-cpp pick it up directly instead of calling
 # find_package(). Pinned to 1.10.1 to match the Rust side's `zenoh = "1.10.1"`.
+# Pre-set BUILD_SHARED_LIBS to OFF in cache so zenoh-c's declare_cache_var
+# doesn't default it to TRUE (which would otherwise turn all unadorned
+# add_library() calls in parent projects like OAI into SHARED libraries).
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static libraries" FORCE)
+
 CPMAddPackage(
   NAME zenohc
   GITHUB_REPOSITORY eclipse-zenoh/zenoh-c
@@ -51,6 +56,7 @@ CPMAddPackage(
   OPTIONS "ZENOHCXX_ZENOHC ON" "ZENOHCXX_ZENOHPICO OFF"
           "ZENOHCXX_ENABLE_TESTS OFF" "ZENOHCXX_ENABLE_EXAMPLES OFF"
 )
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static libraries" FORCE)
 
 # Explicitly STATIC (matching this trio's original implicit behavior, before
 # this file ever set BUILD_SHARED_LIBS/OPTIONS for anything): zenoh-c's own
