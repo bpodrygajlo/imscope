@@ -65,14 +65,17 @@ CPMAddPackage(
 add_library(imscope_internal STATIC src/imscope_internal.cpp src/imscope_internal.h)
 target_include_directories(imscope_internal PUBLIC src/ include/)
 target_link_libraries(imscope_internal PUBLIC zenohcxx::zenohc spdlog)
+set_target_properties(imscope_internal PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(imscope_producer STATIC src/imscope_producer.cpp)
 target_include_directories(imscope_producer PUBLIC include/)
 target_link_libraries(imscope_producer PUBLIC zenohcxx::zenohc imscope_internal)
+set_target_properties(imscope_producer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(imscope_consumer STATIC src/imscope_consumer.cpp)
 target_include_directories(imscope_consumer PUBLIC include/)
 target_link_libraries(imscope_consumer PUBLIC zenohcxx::zenohc imscope_internal)
+set_target_properties(imscope_consumer PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(IMSCOPE_BUILD_TESTS)
   add_subdirectory(test)
